@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir C:vibecodefacebookapi)",
+      "Bash(docker logs facebook-monitor-worker --tail 50)",
+      "Bash(docker logs facebook-monitor-scheduler --tail 50)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

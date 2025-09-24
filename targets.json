@@ -1,0 +1,49 @@
+{
+    "version": "1.0",
+    "description": "Facebook monitoring targets configuration",
+    "last_updated": "2025-09-19T21:37:44.405444",
+    "targets": [
+        {
+            "id": "fb_group_184730418261517",
+            "name": "Facebook Group 184730418261517",
+            "url": "https://www.facebook.com/groups/184730418261517",
+            "type": "group",
+            "enabled": true,
+            "priority": "high",
+            "notes": "Primary monitoring target - enable when ready"
+        },
+        {
+            "id": "fb_group_1085733898269545",
+            "name": "Facebook Group 1085733898269545",
+            "url": "https://www.facebook.com/groups/1085733898269545/",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Secondary monitoring target - enable when ready"
+        },
+        {
+            "id": "fb_group_nguyenquyetthang",
+            "name": "Nguyen Quyet Thang Group",
+            "url": "https://www.facebook.com/groups/nguyenquyetthang/",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Named group target - enable when ready"
+        },
+        {
+            "id": "nasa",
+            "name": "NASA",
+            "url": "https://www.facebook.com/NASA",
+            "type": "profile",
+            "enabled": true,
+            "priority": "high",
+            "notes": ""
+        }
+    ],
+    "settings": {
+        "default_priority": "medium",
+        "max_concurrent_targets": 10,
+        "retry_failed_targets": true,
+        "retry_delay_minutes": 30
+    }
+}

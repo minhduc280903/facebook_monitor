@@ -1,0 +1,61 @@
+{
+  "targets": [
+    {
+      "id": "test_group_1",
+      "url": "https://www.facebook.com/groups/test1",
+      "name": "Test Group 1",
+      "type": "group",
+      "enabled": true,
+      "priority": 1,
+      "check_interval_hours": 1,
+      "last_checked": null,
+      "metadata": {
+        "description": "Test group for unit testing",
+        "member_count": 5000
+      }
+    },
+    {
+      "id": "test_page_1",
+      "url": "https://www.facebook.com/testpage1",
+      "name": "Test Page 1",
+      "type": "page",
+      "enabled": true,
+      "priority": 2,
+      "check_interval_hours": 2,
+      "last_checked": "2024-01-01T12:00:00Z",
+      "metadata": {
+        "followers": 10000,
+        "category": "Technology"
+      }
+    },
+    {
+      "id": "disabled_group",
+      "url": "https://www.facebook.com/groups/disabled",
+      "name": "Disabled Group",
+      "type": "group",
+      "enabled": false,
+      "priority": 3,
+      "check_interval_hours": 6,
+      "last_checked": null,
+      "metadata": {}
+    },
+    {
+      "id": "high_priority_page",
+      "url": "https://www.facebook.com/highpriority",
+      "name": "High Priority Page",
+      "type": "page",
+      "enabled": true,
+      "priority": 1,
+      "check_interval_hours": 0.5,
+      "last_checked": null,
+      "metadata": {
+        "vip": true
+      }
+    }
+  ],
+  "settings": {
+    "max_concurrent_targets": 5,
+    "default_check_interval_hours": 4,
+    "enable_auto_discovery": false
+  }
+}

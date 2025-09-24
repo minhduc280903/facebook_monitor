@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Docker
+.dockerignore
+docker-compose.yml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv
+env
+ENV
+
+# IDE / Editor
+.vscode
+.idea
+.cursor
+.serena
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+logs/
+*.log
+*.db
+*.sqlite3
+
+# Test files
+tests/
+
+# Documentation
+README.md
+
+# Local files
+*.bak
+
+# Browser sessions (local only)
+sessions/
+
+# Environment
+.env

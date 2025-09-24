@@ -1,0 +1,117 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: facebook-monitor-postgres
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d facebook_monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: facebook-monitor-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: facebook-monitor-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    volumes:
+      - ./logs:/app/logs
+
+  scheduler:
+    build: .
+    container_name: facebook-monitor-scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "scan_scheduler.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping(); print('OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  worker:
+    build: .
+    container_name: facebook-monitor-worker
+    restart: unless-stopped
+    depends_on:
+      - scheduler
+    env_file:
+      - ./.env
+    volumes:
+      - ./logs:/app/logs
+      - ./sessions:/app/sessions
+      - ./proxies.txt:/app/proxies.txt
+      - ./targets.json:/app/targets.json
+    command: ["python", "multi_queue_worker.py", "--queues", "scan", "--auto-restart", "--headless"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping(); print('Worker OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  streamlit:
+    build: .
+    container_name: facebook-monitor-streamlit
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    env_file:
+      - ./.env
+    volumes:
+      - ./logs:/app/logs
+      - ./targets.json:/app/targets.json
+    command: ["streamlit", "run", "webapp_streamlit/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/", "||", "exit", "1"]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
