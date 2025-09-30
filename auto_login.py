@@ -32,6 +32,42 @@ class FacebookAutoLogin:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
+    
+    def _cleanup_singleton_locks(self, user_data_dir: str):
+        """
+        Clean up Chrome singleton lock files to prevent "profile in use" errors
+        
+        This is needed because:
+        - Sessions might be in use by workers
+        - Chrome creates lock files that persist even after crash
+        - Docker containers might have stale locks
+        """
+        import glob
+        
+        lock_files = [
+            'SingletonLock',
+            'SingletonSocket',
+            'SingletonCookie'
+        ]
+        
+        for lock_file in lock_files:
+            lock_path = os.path.join(user_data_dir, lock_file)
+            if os.path.exists(lock_path):
+                try:
+                    os.remove(lock_path)
+                    print(f"[CLEANUP] Removed lock file: {lock_file}")
+                except Exception as e:
+                    print(f"[WARNING] Could not remove {lock_file}: {e}")
+        
+        # Also clean lock files in subdirectories
+        for lock_file in lock_files:
+            lock_pattern = os.path.join(user_data_dir, '**', lock_file)
+            for lock_path in glob.glob(lock_pattern, recursive=True):
+                try:
+                    os.remove(lock_path)
+                    print(f"[CLEANUP] Removed nested lock: {lock_path}")
+                except Exception as e:
+                    print(f"[WARNING] Could not remove {lock_path}: {e}")
 
     def parse_account_file(self, account_file_path: str) -> List[Dict[str, str]]:
         """
@@ -96,28 +132,36 @@ class FacebookAutoLogin:
             # Return the original secret as fallback (in case it's already a code)
             return secret
 
-    async def setup_browser(self, session_name: str, headless: bool = False):
-        """Setup browser with session - Enhanced with storage state loading"""
+    async def setup_browser(self, session_name: str, headless: bool = True):
+        """
+        Setup browser with session - FIXED for Docker headless mode
+        
+        CRITICAL FIXES:
+        1. ✅ Default headless=True (Docker has no X server)
+        2. ✅ Remove storage_state param (not supported in persistent context)
+        3. ✅ Clean singleton locks before launch
+        """
         sessions_base_dir = os.path.join(os.getcwd(), "sessions")
         user_data_dir = os.path.join(sessions_base_dir, session_name)
-        storage_state_path = os.path.join(user_data_dir, "storage_state.json")
         
         # Create session directory
         os.makedirs(user_data_dir, exist_ok=True)
         print(f"[FOLDER] Su dung session folder: {user_data_dir}")
         
+        # ✅ FIX: Clean singleton locks before launch (prevent "profile in use" error)
+        self._cleanup_singleton_locks(user_data_dir)
+        
         # Launch browser with consistent configuration
+        # ✅ CRITICAL: NO PROXY for login (use direct connection)
         launch_options = get_browser_launch_options(
-            user_data_dir, headless=headless
+            user_data_dir, 
+            headless=headless,
+            proxy_config=None  # Explicitly no proxy for login
         )
         
-        # ENHANCED: Load storage state nếu tồn tại
-        if os.path.exists(storage_state_path):
-            print(f"[SESSION] Loading saved storage state from: {storage_state_path}")
-            try:
-                launch_options['storage_state'] = storage_state_path
-            except Exception as e:
-                print(f"[WARNING] Không thể load storage state: {e}")
+        # ✅ FIX: DON'T add storage_state to launch_options
+        # Persistent context auto-saves state to user_data_dir
+        # storage_state parameter is NOT supported in launch_persistent_context()
         
         self.browser = await self.playwright.chromium.launch_persistent_context(**launch_options)
         
@@ -496,7 +540,7 @@ class FacebookAutoLogin:
 
 
 async def auto_login_from_file(account_file: str, account_index: Optional[int] = None, 
-                              headless: bool = False):
+                              headless: bool = True):
     """
     Tự động đăng nhập từ file account.txt - GIỐNG Y HỆT manual_login.py
     
@@ -582,7 +626,7 @@ def main():
     # Parse command line arguments
     account_file = "account.txt"
     account_index = None
-    headless = False
+    headless = True  # ✅ Default to True for Docker compatibility
     
     if len(sys.argv) > 1:
         account_file = sys.argv[1]

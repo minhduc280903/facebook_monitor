@@ -13,6 +13,8 @@ import sys
 import io
 import asyncio
 import os
+import threading
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime
 from celery import Celery, current_task
@@ -104,7 +106,11 @@ app.conf.update(
         },
         'refresh-sessions': {
             'task': 'facebook_scraper.refresh_login_sessions',
-            'schedule': 86400.0,  # 24 hours - Re-login daily to keep sessions fresh
+            'schedule': 43200.0,  # 12 hours - Re-login twice daily to keep sessions fresh
+        },
+        'proxy-health-check': {
+            'task': 'facebook_scraper.proxy_health_check_task',
+            'schedule': 900.0,  # 15 minutes - Check proxy health and auto-retry failed ones
         },
     },
     timezone='UTC',
@@ -146,6 +152,9 @@ class SafeBrowserManager:
         session_name = None
         proxy_config = None
         
+        # 🔧 FIX: Track all checked out sessions to ensure cleanup
+        checked_out_sessions = []
+        
         try:
             # Import here để tránh circular imports
             from playwright.async_api import async_playwright
@@ -165,6 +174,9 @@ class SafeBrowserManager:
                     continue
 
                 session_name, proxy_config = session_proxy_pair
+                # 🔧 FIX: Track this checkout
+                checked_out_sessions.append((session_name, proxy_config))
+                
                 session_dir = f"./sessions/{session_name}"
 
                 logger.info(f"✅ Got session-proxy: {session_name} -> {proxy_config.get('proxy_id', 'unknown')}")
@@ -185,13 +197,14 @@ class SafeBrowserManager:
 
                 except Exception as e:
                     logger.error(f"❌ Browser launch failed on attempt {attempt + 1}: {e}")
-                    # Cleanup session-proxy on failed attempt
-                    if session_proxy_pair:
-                        self.session_manager.checkin_session_with_proxy(
-                            session_name, proxy_config, self.proxy_manager,
-                            session_status="READY", proxy_status="READY"
-                        )
-                        session_name, proxy_config = None, None  # Reset for cleanup
+                    # 🔧 FIX: Cleanup session-proxy on failed attempt IMMEDIATELY
+                    self.session_manager.checkin_session_with_proxy(
+                        session_name, proxy_config, self.proxy_manager,
+                        session_status="READY", proxy_status="READY"
+                    )
+                    # Remove from tracking since we checked it in
+                    checked_out_sessions.remove((session_name, proxy_config))
+                    session_name, proxy_config = None, None  # Reset for cleanup
                     if attempt == max_retries - 1:
                         raise
 
@@ -248,16 +261,16 @@ class SafeBrowserManager:
                 except Exception as e:
                     cleanup_errors.append(f"Playwright stop error: {e}")
             
-            # 3. Checkin session-proxy pair
-            if session_name and proxy_config:
+            # 🔧 FIX: Cleanup ALL checked out sessions, not just successful one
+            for sess_name, prox_config in checked_out_sessions:
                 try:
                     self.session_manager.checkin_session_with_proxy(
-                        session_name, proxy_config, self.proxy_manager,
+                        sess_name, prox_config, self.proxy_manager,
                         session_status="READY", proxy_status="READY"
                     )
-                    logger.info(f"✅ Session-proxy checked in: {session_name}")
+                    logger.info(f"✅ Session-proxy checked in: {sess_name}")
                 except Exception as e:
-                    cleanup_errors.append(f"Session checkin error: {e}")
+                    cleanup_errors.append(f"Session checkin error for {sess_name}: {e}")
             
             # 4. ENHANCEMENT: Cleanup tracked browser PIDs
             try:
@@ -405,18 +418,7 @@ class SafeBrowserManager:
             logger.error(f"❌ Error cleaning up zombie browsers: {e}")
             return {'killed_zombies': 0, 'killed_orphaned': 0, 'zombie_pids': [], 'orphaned_pids': [], 'total_killed': 0}
 
-# Legacy BrowserManager for backward compatibility (DEPRECATED)
-class BrowserManager:
-    """⚠️ DEPRECATED: Use SafeBrowserManager instead. This class has resource leak issues."""
-    
-    def __init__(self):
-        logger.warning("⚠️ DEPRECATED BrowserManager used. Migrate to SafeBrowserManager.browser_session()")
-        self.safe_manager = SafeBrowserManager()
-    
-    async def get_browser_session(self):
-        """⚠️ DEPRECATED: Resource leak prone method"""
-        logger.error("❌ DEPRECATED get_browser_session() called. Use SafeBrowserManager.browser_session() context manager!")
-        raise DeprecationWarning("Use SafeBrowserManager.browser_session() context manager for guaranteed cleanup")
+# ✅ REMOVED: Deprecated BrowserManager class - use SafeBrowserManager.browser_session() instead
 
 # CELERY TASKS - THAY THẾ MultiQueueWorker.process_queues()
 
@@ -813,6 +815,56 @@ def browser_health_check():
     
     # Run async function
     return asyncio.run(_async_browser_health_check())
+
+@app.task(name='facebook_scraper.proxy_health_check_task')
+def proxy_health_check_task():
+    """
+    🔍 Proxy Health Check Task - Background task để check và auto-retry proxies
+    
+    Features:
+    - Check health của tất cả proxies (READY, FAILED, QUARANTINED)
+    - Auto-retry failed proxies
+    - Release proxies từ quarantine nếu đã hết cooldown
+    - Update proxy status và performance metrics
+    """
+    try:
+        from core.proxy_manager import ProxyManager
+        
+        logger.info("🔍 Starting proxy health check task...")
+        
+        proxy_manager = ProxyManager()
+        
+        # 1. Process cooldowns first - release proxies from quarantine
+        released_count = proxy_manager.check_cooldowns()
+        if released_count > 0:
+            logger.info(f"🎆 Released {released_count} proxies from quarantine")
+        
+        # 2. Run comprehensive health check
+        result = proxy_manager.run_comprehensive_health_check()
+        
+        logger.info(f"✅ Proxy health check completed:")
+        logger.info(f"  📊 Checked: {result['checked_count']} proxies")
+        logger.info(f"  ✅ Healthy: {result['healthy_count']} proxies")
+        logger.info(f"  ❌ Unhealthy: {result['unhealthy_count']} proxies")
+        
+        # 3. Get updated stats
+        stats = proxy_manager.get_stats()
+        
+        return {
+            'status': 'success',
+            'timestamp': datetime.now().isoformat(),
+            'released_from_quarantine': released_count,
+            'health_check': result,
+            'current_stats': stats
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Proxy health check task failed: {e}")
+        return {
+            'status': 'error',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }
 
 # COMPATIBILITY với existing code
 def main():

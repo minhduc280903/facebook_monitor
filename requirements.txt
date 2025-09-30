@@ -29,6 +29,9 @@ aiofiles>=23.2.0
 requests>=2.31.0
 aiohttp>=3.9.0  # For async proxy health checks
 
+# Date/Time Utilities
+python-dateutil>=2.8.2  # For flexible timestamp parsing
+
 # Browser Automation
 playwright>=1.40.0
 botright>=0.5.1

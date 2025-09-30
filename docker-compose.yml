@@ -46,6 +46,9 @@ services:
       - ./.env
     volumes:
       - ./logs:/app/logs
+      - ./core:/app/core
+      - ./utils:/app/utils
+      - ./config.py:/app/config.py:ro
 
   # MIGRATION: Celery Beat scheduler thay cho manual scheduler
   scheduler:
@@ -61,6 +64,9 @@ services:
       - ./.env
     volumes:
       - ./logs:/app/logs
+      - ./core:/app/core
+      - ./utils:/app/utils
+      - ./config.py:/app/config.py:ro
     # CHANGED: Celery Beat command thay cho python scan_scheduler.py
     command: ["celery", "-A", "multi_queue_worker", "beat", "--loglevel=info"]
     healthcheck:
@@ -86,9 +92,23 @@ services:
       - ./targets.json:/app/targets.json
       - ./auto_login.py:/app/auto_login.py:ro
       - ./account.txt:/app/account.txt:ro
+      - ./core:/app/core
+      - ./utils:/app/utils
+      - ./scrapers:/app/scrapers
+      - ./config.py:/app/config.py:ro
+      - ./selectors.json:/app/selectors.json:ro
     # CHANGED: Celery worker command với priority queues
+    # Cleanup session locks before starting worker AND periodically during runtime
+    # Clear proxy cache to ensure fresh proxy config from proxies.txt
     # Concurrency increased to 3 for better throughput (adjust based on available sessions/proxies)
-    command: ["celery", "-A", "multi_queue_worker", "worker", "--loglevel=info", "--queues=scan_high,scan_normal,discovery,maintenance", "--concurrency=3"]
+    command: >
+      sh -c 'find ./sessions -name "SingletonLock" -type f -delete 2>/dev/null || true &&
+             find ./sessions -name "SingletonCookie" -type f -delete 2>/dev/null || true &&
+             find ./sessions -name "SingletonSocket" -type f -delete 2>/dev/null || true &&
+             rm -f proxy_status.json session_proxy_bindings.json 2>/dev/null || true &&
+             echo "✅ Session locks and proxy cache cleaned (worker)" &&
+             (while true; do sleep 300; find ./sessions -name "SingletonLock" -type f -delete 2>/dev/null || true; find ./sessions -name "SingletonCookie" -type f -delete 2>/dev/null || true; find ./sessions -name "SingletonSocket" -type f -delete 2>/dev/null || true; echo "🔄 Periodic lock cleanup done"; done &) &&
+             celery -A multi_queue_worker worker --loglevel=info --queues=scan_high,scan_normal,discovery,maintenance --pool=solo'
     healthcheck:
       test: ["CMD", "python", "-c", "from multi_queue_worker import health_check; print('Worker OK')"]
       interval: 30s
@@ -109,7 +129,7 @@ services:
       - ./.env
     command: ["celery", "-A", "multi_queue_worker", "flower", "--port=5555"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5555/", "||", "exit", "1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:5555/ || exit 1"]
       interval: 60s
       timeout: 15s
       retries: 5
@@ -130,7 +150,7 @@ services:
       - ./targets.json:/app/targets.json
     command: ["streamlit", "run", "webapp_streamlit/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/", "||", "exit", "1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/ || exit 1"]
       interval: 60s
       timeout: 15s
       retries: 5

@@ -20,6 +20,7 @@ from .browser_controller import BrowserController, CaptchaException
 from .content_extractor import ContentExtractor
 from .navigation_handler import NavigationHandler
 from .interaction_simulator import InteractionSimulator
+from utils.timestamp_parser import parse_facebook_timestamp
 
 logger = get_logger(__name__)
 
@@ -74,13 +75,9 @@ class ScraperCoordinator:
     
     def _parse_facebook_timestamp(self, time_string: str) -> Optional[datetime]:
         """
-        Phân tích chuỗi thời gian Facebook thành datetime object. (PHIÊN BẢN SỬA LỖI)
+        Phân tích chuỗi thời gian Facebook thành datetime object.
         
-        Xử lý các định dạng phổ biến:
-        - "2 hours ago", "3 minutes ago"
-        - "Yesterday", "Today"
-        - "September 18", "18 Thg 9"
-        - "2025-09-19" (ISO format)
+        ⚠️ REFACTORED: Logic đã được tách ra utils.timestamp_parser để dễ maintain
         
         Args:
             time_string: Chuỗi thời gian từ Facebook
@@ -88,118 +85,7 @@ class ScraperCoordinator:
         Returns:
             datetime object hoặc None nếu không thể phân tích
         """
-        if not time_string:
-            return None
-            
-        time_string = time_string.strip().lower()
-        now = datetime.now()
-        
-        try:
-            # Pattern 1: "X minutes/hours/days ago"
-            ago_pattern = r'(\d+)\s*(minute|hour|day|week)s?\s*ago'
-            match = re.search(ago_pattern, time_string)
-            if match:
-                value = int(match.group(1))
-                unit = match.group(2)
-                
-                if unit == 'minute':
-                    return now - timedelta(minutes=value)
-                elif unit == 'hour':
-                    return now - timedelta(hours=value)
-                elif unit == 'day':
-                    return now - timedelta(days=value)
-                elif unit == 'week':
-                    return now - timedelta(weeks=value)
-            
-            # Pattern 2: "Yesterday"
-            if 'yesterday' in time_string:
-                return now - timedelta(days=1)
-            
-            # Pattern 3: "Today" hoặc "just now"
-            if 'today' in time_string or 'just now' in time_string or 'now' in time_string:
-                return now
-            
-            # SỬA LỖI LOGIC: Xử lý "Tháng Ngày" (ví dụ: "September 18", "18 Thg 9")
-            # Thay thế khối logic cũ bằng khối logic mới này
-            month_map = {
-                'jan': 1, 'january': 1, 'thg 1': 1,
-                'feb': 2, 'february': 2, 'thg 2': 2,
-                'mar': 3, 'march': 3, 'thg 3': 3,
-                'apr': 4, 'april': 4, 'thg 4': 4,
-                'may': 5, 'may': 5, 'thg 5': 5,
-                'jun': 6, 'june': 6, 'thg 6': 6,
-                'jul': 7, 'july': 7, 'thg 7': 7,
-                'aug': 8, 'august': 8, 'thg 8': 8,
-                'sep': 9, 'september': 9, 'thg 9': 9,
-                'oct': 10, 'october': 10, 'thg 10': 10,
-                'nov': 11, 'november': 11, 'thg 11': 11,
-                'dec': 12, 'december': 12, 'thg 12': 12,
-            }
-
-            # Regex để bắt "tháng ngày" hoặc "ngày tháng"
-            pattern = '|'.join(month_map.keys())
-            match = re.search(r'(\d{1,2})?\s*(' + pattern + r')\s*(\d{1,2})?', time_string)
-            if match:
-                parts = [p for p in match.groups() if p and p.strip()]
-                if len(parts) >= 2:
-                    # Phân tích tháng và ngày từ các phần tìm được
-                    month_str = None
-                    day_str = None
-                    
-                    for part in parts:
-                        if part in month_map:
-                            month_str = part
-                        elif part.isdigit():
-                            day_str = part
-                    
-                    if month_str and day_str:
-                        try:
-                            day = int(day_str)
-                            month = month_map[month_str]
-                            year = now.year # Mặc định là năm hiện tại
-
-                            # Giả định thông minh: nếu tháng phân tích được lớn hơn tháng hiện tại,
-                            # có thể bài viết là của năm ngoái.
-                            # FIXED: Xử lý edge case khi ở tháng 1-2 và post là tháng 11-12
-                            if month > now.month:
-                                year = now.year - 1
-                            # FIXED: Xử lý edge case khi post date trong tương lai (do timezone/date difference)
-                            elif month == now.month and day > now.day:
-                                # Nếu ngày lớn hơn ngày hiện tại trong cùng tháng, có thể là timezone issue
-                                # hoặc post là của tháng trước năm ngoái
-                                test_date = datetime(year, month, day)
-                                if test_date > now:
-                                    year = now.year - 1
-
-                            return datetime(year, month, day)
-                        except (ValueError, KeyError):
-                            pass
-                            
-            # Thử phân tích định dạng ISO hoặc các định dạng khác
-            date_patterns = [
-                r'(\d+)[-/](\d+)[-/](\d{4})',  # DD/MM/YYYY hoặc DD-MM-YYYY
-                r'(\d{4})[-/](\d+)[-/](\d+)',  # YYYY/MM/DD hoặc YYYY-MM-DD
-            ]
-            
-            for pattern in date_patterns:
-                match = re.search(pattern, time_string)
-                if match:
-                    try:
-                        if len(match.group(1)) == 4:  # YYYY/MM/DD format
-                            year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                        else:  # DD/MM/YYYY format
-                            day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                        return datetime(year, month, day)
-                    except (ValueError, TypeError):
-                        continue
-
-        except Exception as e:
-            logger.error(f"❌ Lỗi phân tích timestamp '{time_string}': {e}")
-            
-        # SỬA LỖI LOGIC: Thay đổi hành vi fallback
-        # Thay vì return now, hãy trả về None
-        logger.warning(f"⚠️ Không thể phân tích timestamp: '{time_string}'")
-        return None
+        return parse_facebook_timestamp(time_string)
     
     async def _extract_post_time(self, post_element) -> Optional[str]:
         """
@@ -470,7 +356,7 @@ class ScraperCoordinator:
                     await self.interaction_simulator.humanized_delay_between_posts(i, len(post_elements))
                     
                 except Exception as e:
-                    logger.error(f"❌ Lỗi xử lý post {i+1}: {e}")
+                    logger.error(f"❌ Error processing post {i+1}/{len(post_elements)}: {e}", exc_info=False)
                     results["errors"] += 1
                     continue
             
@@ -482,8 +368,8 @@ class ScraperCoordinator:
             # Re-raise CAPTCHA exception for higher-level handling
             raise
         except Exception as e:
-            logger.error(f"💥 Lỗi nghiêm trọng xử lý URL {url}: {e}")
-            return {"new_posts": 0, "interactions_logged": 0, "errors": 1, "reason": str(e)}
+            logger.error(f"💥 Critical error processing URL {url}: {type(e).__name__}: {e}", exc_info=True)
+            return {"new_posts": 0, "interactions_logged": 0, "errors": 1, "reason": f"{type(e).__name__}: {str(e)}"}
 
     async def _scroll_to_bottom_of_feed(self, max_posts: Optional[int] = None, max_scroll_time: Optional[int] = None) -> List[Any]:
         """
@@ -585,7 +471,7 @@ class ScraperCoordinator:
             return details
             
         except Exception as e:
-            logger.error(f"❌ Lỗi extract post details: {e}")
+            logger.error(f"❌ Error extracting post details: {type(e).__name__}: {e}", exc_info=False)
             return None
     
     async def _process_fast_stream(self, post_element, source_url: str) -> Dict[str, Any]:
@@ -632,8 +518,8 @@ class ScraperCoordinator:
             }
             
         except Exception as e:
-            logger.error(f"❌ Lỗi fast stream: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"❌ Error in fast stream processing: {type(e).__name__}: {e}", exc_info=False)
+            return {"success": False, "error": f"{type(e).__name__}: {str(e)}"}
     
     async def _process_one_time_stream(self, post_element, post_signature: str, source_url: str) -> Dict[str, Any]:
         """

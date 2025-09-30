@@ -16,6 +16,7 @@ import threading
 import time
 import logging
 import asyncio
+from contextlib import contextmanager
 from logging_config import get_logger
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
@@ -180,24 +181,27 @@ class SessionManager:
             status_file: File JSON theo dõi trạng thái sessions
             sessions_dir: Thư mục chứa các session folders
         """
+        from config import settings
+        
         self.status_file = status_file
         self.sessions_dir = sessions_dir
         self.lock = threading.Lock()  # Thread-safe access
         
-        # Performance thresholds for intelligent quarantine
-        self.consecutive_failure_threshold = 5
-        self.success_rate_threshold = 0.6
-        self.min_tasks_for_rate_calc = 10
-        self.quarantine_duration_minutes = 60  # Default quarantine time
+        # Load performance thresholds from config instead of hard-coded values
+        resource_config = settings.resource_management
+        self.consecutive_failure_threshold = resource_config.session_failure_threshold
+        self.success_rate_threshold = resource_config.session_success_rate_threshold
+        self.min_tasks_for_rate_calc = resource_config.min_tasks_for_rate_calc
+        self.quarantine_duration_minutes = resource_config.session_quarantine_minutes
         
         # Resource pool (in-memory cache)
         self.resource_pool: Dict[str, ManagedResource] = {}
         
-        # 🔧 PERFORMANCE OPTIMIZATION: Batch file writes to reduce I/O
+        # 🔧 PERFORMANCE OPTIMIZATION: Batch file writes to reduce I/O (from config)
         self.pending_file_sync = False
         self.last_file_sync_time = datetime.now()
-        self.file_sync_interval_seconds = 5  # Write to file max once per 5 seconds
-        self.file_sync_change_threshold = 10  # Or after 10 changes
+        self.file_sync_interval_seconds = resource_config.file_sync_interval_seconds
+        self.file_sync_change_threshold = resource_config.file_sync_change_threshold
         self.changes_since_last_sync = 0
         
         # 🔗 PRODUCTION FIX: Session-Proxy binding
@@ -456,6 +460,40 @@ class SessionManager:
             logger.error(f"❌ Lỗi ghi session status: {e}")
             raise
     
+    def _execute_with_locks(self, operation_func):
+        """
+        Template Method Pattern - thực thi operation với thread + process locks.
+        
+        Args:
+            operation_func: Callable to execute within locks
+            
+        Returns:
+            Result from operation_func
+        """
+        with self.lock:
+            if self.file_lock:
+                with self.file_lock:
+                    return operation_func()
+            else:
+                return operation_func()
+    
+    @contextmanager
+    def locks(self):
+        """
+        Context manager for unified lock handling.
+        Use this for cleaner code instead of _execute_with_locks.
+        
+        Usage:
+            with self.locks():
+                # ... do work ...
+        """
+        with self.lock:
+            if self.file_lock:
+                with self.file_lock:
+                    yield
+            else:
+                yield
+    
     def _sync_resources_to_file(self, force: bool = False):
         """
         Sync in-memory resources back to file with batching optimization.
@@ -516,19 +554,11 @@ class SessionManager:
             # Process cooldowns first
             self._process_cooldowns()
             
-            # Thread + process safe checkout
-            with self.lock:
-                if self.file_lock:
-                    with self.file_lock:
-                        result = self._intelligent_checkout()
-                        if result:
-                            self._sync_resources_to_file()
-                            return result
-                else:
-                    result = self._intelligent_checkout()
-                    if result:
-                        self._sync_resources_to_file()
-                        return result
+            # Use refactored lock helper
+            result = self._execute_with_locks(self._intelligent_checkout)
+            if result:
+                self._execute_with_locks(self._sync_resources_to_file)
+                return result
             
             time.sleep(1)
         
@@ -553,30 +583,16 @@ class SessionManager:
         while time.time() - start_time < timeout and attempt_count < max_attempts:
             attempt_count += 1
 
-            # Process cooldowns first
-            self._process_cooldowns()
-
-            # Try to get session-proxy pair with minimal locking
+            # FIX: Atomic operation - process cooldowns and checkout trong cùng lock
             try:
-                # Thread + process safe checkout with shorter lock duration
-                with self.lock:
-                    if self.file_lock:
-                        # Use timeout on file lock to prevent indefinite blocking
-                        try:
-                            with self.file_lock.acquire(timeout=10):  # Increased to 10 seconds for high-contention environments
-                                result = self._checkout_session_with_bound_proxy(proxy_manager)
-                                if result:
-                                    self._sync_resources_to_file()
-                                    return result
-                        except Exception as e:
-                            # File lock timeout, continue to next attempt
-                            logger.debug(f"File lock acquire timeout: {e}")
-                            pass
-                    else:
-                        result = self._checkout_session_with_bound_proxy(proxy_manager)
-                        if result:
-                            self._sync_resources_to_file()
-                            return result
+                result = self._execute_with_locks(lambda: (
+                    self._process_cooldowns(),  # ✅ ATOMIC with checkout
+                    self._checkout_session_with_bound_proxy(proxy_manager)
+                )[1])  # Return checkout result only
+                
+                if result:
+                    self._execute_with_locks(self._sync_resources_to_file)
+                    return result
             except Exception as e:
                 logger.debug(f"Checkout attempt {attempt_count} failed: {e}")
 
@@ -709,21 +725,14 @@ class SessionManager:
             # Process cooldowns first
             self._process_cooldowns()
             
-            # Thread + process safe checkout by role
-            with self.lock:
-                if self.file_lock:
-                    with self.file_lock:
-                        result = self._intelligent_checkout_by_role(role)
-                        if result:
-                            self._sync_resources_to_file()
-                            logger.info(f"✅ Assigned {role.value} session: {result}")
-                            return result
-                else:
-                    result = self._intelligent_checkout_by_role(role)
-                    if result:
-                        self._sync_resources_to_file()
-                        logger.info(f"✅ Assigned {role.value} session: {result}")
-                        return result
+            # Use refactored lock helper
+            result = self._execute_with_locks(
+                lambda: self._intelligent_checkout_by_role(role)
+            )
+            if result:
+                self._execute_with_locks(self._sync_resources_to_file)
+                logger.info(f"✅ Assigned {role.value} session: {result}")
+                return result
             
             time.sleep(1)
         
@@ -851,9 +860,15 @@ class SessionManager:
         
         return sorted_resources[0]
     
-    def _process_cooldowns(self):
-        """Process quarantined resources and release those past cooldown period."""
+    def _process_cooldowns(self) -> int:
+        """
+        Process quarantined resources and release those past cooldown period.
+        
+        Returns:
+            Number of resources released from quarantine
+        """
         current_time = datetime.now()
+        released_count = 0
         
         for resource in self.resource_pool.values():
             if resource.status == "QUARANTINED" and resource.quarantine_until_timestamp:
@@ -861,10 +876,18 @@ class SessionManager:
                     resource.status = "READY"
                     resource.quarantine_until_timestamp = None
                     resource.consecutive_failures = 0  # Reset failures after cooldown
+                    released_count += 1
                     logger.info(f"🎆 Resource {resource.id} released from quarantine")
+        
+        return released_count
     
-    def _log_resource_stats(self):
-        """Log current resource statistics for debugging."""
+    def _log_resource_stats(self) -> None:
+        """
+        Log current resource statistics for debugging.
+        
+        Returns:
+            None
+        """
         stats = {"ready": 0, "in_use": 0, "quarantined": 0, "needs_login": 0, "disabled": 0}
         
         for resource in self.resource_pool.values():
@@ -889,17 +912,22 @@ class SessionManager:
             session_name: Tên session cần trả lại
             status: Trạng thái mới của session (default: "READY")
         """
-        with self.lock:
-            if self.file_lock:
-                with self.file_lock:
-                    self._intelligent_checkin(session_name, status)
-                    self._sync_resources_to_file()
-            else:
-                self._intelligent_checkin(session_name, status)
-                self._sync_resources_to_file()
+        self._execute_with_locks(
+            lambda: self._intelligent_checkin(session_name, status)
+        )
+        self._execute_with_locks(self._sync_resources_to_file)
     
-    def _intelligent_checkin(self, session_name: str, status: str):
-        """Intelligent checkin với performance tracking."""
+    def _intelligent_checkin(self, session_name: str, status: str) -> None:
+        """
+        Intelligent checkin với performance tracking.
+        
+        Args:
+            session_name: Tên session
+            status: Status mới
+            
+        Returns:
+            None
+        """
         try:
             if session_name not in self.resource_pool:
                 logger.warning(f"⚠️ Session không tồn tại: {session_name}")
@@ -914,17 +942,19 @@ class SessionManager:
         except Exception as e:
             logger.error(f"❌ Lỗi intelligent checkin {session_name}: {e}")
     
-    def configure_account_roles(self, role_assignments: Dict[str, AccountRole]):
+    def configure_account_roles(self, role_assignments: Dict[str, AccountRole]) -> int:
         """
         Configure account roles for specialized assignment
         
         Args:
             role_assignments: Dict mapping session_name -> AccountRole
                               e.g., {"account_1": AccountRole.DISCOVERY, "account_2": AccountRole.TRACKING}
+                              
+        Returns:
+            Số lượng accounts đã configure
         """
-        with self.lock:
+        def _update_roles():
             updated_count = 0
-            
             for session_name, role in role_assignments.items():
                 if session_name in self.resource_pool:
                     old_role = self.resource_pool[session_name].role
@@ -933,16 +963,13 @@ class SessionManager:
                     updated_count += 1
                 else:
                     logger.warning(f"⚠️ Session {session_name} không tồn tại để configure role")
-            
-            if updated_count > 0:
-                # Sync changes to file
-                if self.file_lock:
-                    with self.file_lock:
-                        self._sync_resources_to_file()
-                else:
-                    self._sync_resources_to_file()
-                
-                logger.info(f"✅ Đã configure {updated_count} account roles")
+            return updated_count
+        
+        updated_count = self._execute_with_locks(_update_roles)
+        
+        if updated_count > 0:
+            self._execute_with_locks(self._sync_resources_to_file)
+            logger.info(f"✅ Đã configure {updated_count} account roles")
             
         return updated_count
     
@@ -1139,7 +1166,7 @@ class SessionManager:
         logger.warning(f"❌ Marking session invalid: {session_name} - {reason}")
         self.checkin_session(session_name, "NEEDS_LOGIN")
     
-    def report_outcome(self, session_name: str, outcome: str, details: Dict[str, Any] = None):
+    def report_outcome(self, session_name: str, outcome: str, details: Optional[Dict[str, Any]] = None) -> None:
         """
         Báo cáo kết quả task để cập nhật performance metrics
         
@@ -1147,8 +1174,11 @@ class SessionManager:
             session_name: Tên session
             outcome: 'success' hoặc 'failure'
             details: Thông tin chi tiết về task
+            
+        Returns:
+            None
         """
-        with self.lock:
+        with self.locks():
             if session_name not in self.resource_pool:
                 logger.warning(f"⚠️ Session không tồn tại để report outcome: {session_name}")
                 return
@@ -1176,21 +1206,20 @@ class SessionManager:
                 self.quarantine_resource(session_name, f"Performance threshold exceeded: {resource.consecutive_failures} consecutive failures, {resource.success_rate:.2f} success rate")
             
             # Sync to file
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
+            self._sync_resources_to_file()
     
-    def quarantine_resource(self, session_name: str, reason: str = "Performance issues"):
+    def quarantine_resource(self, session_name: str, reason: str = "Performance issues") -> None:
         """
         Cách ly resource vào quarantine với cooldown period
         
         Args:
             session_name: Tên session
             reason: Lý do cách ly
+            
+        Returns:
+            None
         """
-        with self.lock:
+        with self.locks():
             if session_name not in self.resource_pool:
                 logger.warning(f"⚠️ Session không tồn tại để quarantine: {session_name}")
                 return
@@ -1204,40 +1233,36 @@ class SessionManager:
             logger.warning(f"🚨 Session {session_name} quarantined until {resource.quarantine_until_timestamp.strftime('%H:%M:%S')} - {reason}")
             
             # Sync to file
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
+            self._sync_resources_to_file()
     
-    def reset_all_sessions(self):
-        """Reset tất cả sessions về trạng thái READY (debug only) - thread + process-safe"""
-        with self.lock:
+    def reset_all_sessions(self) -> None:
+        """
+        Reset tất cả sessions về trạng thái READY (debug only) - thread + process-safe.
+        
+        Returns:
+            None
+        """
+        with self.locks():
             for resource in self.resource_pool.values():
                 resource.status = "READY"
                 resource.consecutive_failures = 0
                 resource.quarantine_until_timestamp = None
                 resource.quarantine_reason = None
             
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file(force=True)  # Force immediate sync for reset
-            else:
-                self._sync_resources_to_file(force=True)
-            
+            self._sync_resources_to_file(force=True)  # Force immediate sync for reset
             logger.info("🔄 Reset tất cả sessions về READY")
     
-    def check_cooldowns(self):
+    def check_cooldowns(self) -> int:
         """
-        Public method để kiểm tra và xử lý cooldowns (có thể gọi từ scheduler)
+        Public method để kiểm tra và xử lý cooldowns (có thể gọi từ scheduler).
+        
+        Returns:
+            Number of resources released from quarantine
         """
-        with self.lock:
-            self._process_cooldowns()
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file(force=True)  # Force sync for cooldown updates
-            else:
-                self._sync_resources_to_file(force=True)
+        with self.locks():
+            released_count = self._process_cooldowns()
+            self._sync_resources_to_file(force=True)  # Force sync for cooldown updates
+            return released_count
     
     def increment_failure_count(self, session_name: str, threshold: int = 3) -> bool:
         """

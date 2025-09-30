@@ -65,5 +65,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Lệnh để chạy ứng dụng khi container khởi động
-# Chạy uvicorn, trỏ đến app object trong file api/main.py
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Cleanup session locks trước khi chạy service
+CMD sh -c 'find ./sessions -name "SingletonLock" -type f -delete 2>/dev/null || true; \
+           find ./sessions -name "SingletonCookie" -type f -delete 2>/dev/null || true; \
+           find ./sessions -name "SingletonSocket" -type f -delete 2>/dev/null || true; \
+           echo "✅ Session locks cleaned"; \
+           exec "$@"' -- uvicorn api.main:app --host 0.0.0.0 --port 8000

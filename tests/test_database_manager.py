@@ -174,4 +174,74 @@ class TestDatabaseManagerRefactored:
         db = db_manager_with_mocks
         db.close()
         db.mock_pool.closeall.assert_called_once()
+    
+    def test_get_existing_post_signatures_batch(self, db_manager_with_mocks):
+        """Test batch check for existing posts - FIX for N+1 query problem."""
+        db = db_manager_with_mocks
+        
+        # Mock fetchall to return some existing signatures
+        db.mock_cursor.fetchall.return_value = [
+            {'post_signature': 'sig1'},
+            {'post_signature': 'sig3'}
+        ]
+        
+        signatures = ['sig1', 'sig2', 'sig3', 'sig4']
+        existing = db.get_existing_post_signatures_batch(signatures)
+        
+        # Should return set of existing signatures
+        assert existing == {'sig1', 'sig3'}
+        
+        # Verify single query with all signatures
+        db.mock_cursor.execute.assert_called_once()
+        sql, params = db.mock_cursor.execute.call_args[0]
+        assert "WHERE post_signature = ANY(%s)" in sql
+        assert params[0] == signatures
+        
+        # Verify pool usage
+        db.mock_pool.getconn.assert_called_once()
+        db.mock_pool.putconn.assert_called_once()
+    
+    def test_log_interactions_batch(self, db_manager_with_mocks):
+        """Test batch insert interactions - FIX for N+1 query problem."""
+        db = db_manager_with_mocks
+        db.mock_cursor.rowcount = 3  # Simulate 3 rows inserted
+        
+        interactions = [
+            {
+                'post_signature': 'sig1',
+                'log_timestamp_utc': '2025-09-30T10:00:00+00:00',
+                'like_count': 10,
+                'comment_count': 5
+            },
+            {
+                'post_signature': 'sig2',
+                'log_timestamp_utc': '2025-09-30T10:00:00+00:00',
+                'like_count': 20,
+                'comment_count': 10
+            },
+            {
+                'post_signature': 'sig3',
+                'log_timestamp_utc': '2025-09-30T10:00:00+00:00',
+                'like_count': 30,
+                'comment_count': 15
+            }
+        ]
+        
+        inserted_count = db.log_interactions_batch(interactions)
+        
+        # Should return number of inserted interactions
+        assert inserted_count == 3
+        
+        # Verify executemany was called with batch insert
+        db.mock_cursor.executemany.assert_called_once()
+        sql, params = db.mock_cursor.executemany.call_args[0]
+        assert "INSERT INTO interactions" in sql
+        assert len(params) == 3
+        
+        # Verify commit
+        db.mock_connection.commit.assert_called_once()
+        
+        # Verify pool usage
+        db.mock_pool.getconn.assert_called_once()
+        db.mock_pool.putconn.assert_called_once()
 

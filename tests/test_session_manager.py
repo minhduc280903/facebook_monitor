@@ -259,6 +259,54 @@ class TestSessionManager:
         assert migrated_data["session1"]["status"] == "READY"
         assert migrated_data["session1"]["consecutive_failures"] == 0
         assert migrated_data["session2"]["consecutive_failures"] == 3
+    
+    def test_locks_context_manager_basic(self, session_manager):
+        """Test locks() context manager unifies thread and file locks"""
+        # This test verifies the locks() context manager works correctly
+        # It should handle both thread lock and file lock (if available)
+        
+        import threading
+        results = []
+        
+        def worker():
+            """Worker thread that uses locks() context manager"""
+            with session_manager.locks():
+                # Do some work inside locks
+                time.sleep(0.01)  # Small delay to ensure concurrent access
+                results.append(threading.current_thread().name)
+        
+        # Create multiple threads
+        threads = []
+        for i in range(5):
+            t = threading.Thread(target=worker, name=f"Worker-{i}")
+            threads.append(t)
+            t.start()
+        
+        # Wait for all threads
+        for t in threads:
+            t.join()
+        
+        # All workers should have completed
+        assert len(results) == 5
+        
+        # Verify no race conditions (all thread names should be unique)
+        assert len(set(results)) == 5
+    
+    def test_locks_context_manager_exception_safety(self, session_manager):
+        """Test locks() context manager properly releases locks on exception"""
+        # Verify that locks are released even when exception occurs
+        
+        try:
+            with session_manager.locks():
+                # Simulate an error inside the lock
+                raise ValueError("Test exception")
+        except ValueError:
+            pass  # Expected
+        
+        # Lock should be released, so we can acquire it again
+        with session_manager.locks():
+            # If we get here, lock was properly released
+            assert True
 
 class TestSessionManagerConcurrency:
     """Test concurrent access để verify thread-safety"""

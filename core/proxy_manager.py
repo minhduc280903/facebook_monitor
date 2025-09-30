@@ -17,6 +17,7 @@ import threading
 import time
 import asyncio
 import requests
+from contextlib import contextmanager
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 from .session_manager import ManagedResource  # Reuse the ManagedResource class
@@ -56,16 +57,19 @@ class ProxyManager:
             proxy_file: File chứa danh sách proxy (format: ip:port:user:pass hoặc ip:port)
             status_file: File JSON theo dõi trạng thái proxies
         """
+        from config import settings
+        
         self.proxy_file = proxy_file
         self.status_file = status_file
         self.lock = threading.Lock()  # Thread-safe access
         
-        # Performance thresholds for intelligent proxy management
-        self.consecutive_failure_threshold = 3  # Lower than sessions
-        self.success_rate_threshold = 0.7  # Higher than sessions (proxies need to be reliable)
-        self.min_tasks_for_rate_calc = 5  # Lower threshold for faster quarantine
-        self.quarantine_duration_minutes = 30  # Shorter quarantine for proxies
-        self.health_check_interval_minutes = 15
+        # Load performance thresholds from config instead of hard-coded values
+        resource_config = settings.resource_management
+        self.consecutive_failure_threshold = resource_config.proxy_failure_threshold
+        self.success_rate_threshold = resource_config.proxy_success_rate_threshold
+        self.min_tasks_for_rate_calc = resource_config.min_tasks_for_rate_calc
+        self.quarantine_duration_minutes = resource_config.proxy_quarantine_minutes
+        self.health_check_interval_minutes = 15  # Keep this for now
         
         # Proxy pool (in-memory cache) using ManagedResource
         self.resource_pool: Dict[str, ManagedResource] = {}
@@ -118,9 +122,15 @@ class ProxyManager:
             status_data[resource_id] = resource.to_dict()
         self._write_status_file(status_data)
     
-    def _process_cooldowns(self):
-        """Process quarantined proxies and release those past cooldown period."""
+    def _process_cooldowns(self) -> int:
+        """
+        Process quarantined proxies and release those past cooldown period.
+        
+        Returns:
+            Number of proxies released from quarantine
+        """
         current_time = datetime.now()
+        released_count = 0
         
         for resource in self.resource_pool.values():
             if resource.status == "QUARANTINED" and resource.quarantine_until_timestamp:
@@ -128,7 +138,10 @@ class ProxyManager:
                     resource.status = "READY"
                     resource.quarantine_until_timestamp = None
                     resource.consecutive_failures = 0  # Reset failures after cooldown
+                    released_count += 1
                     logger.info(f"🎆 Proxy {resource.id} released from quarantine")
+        
+        return released_count
     
     def _maybe_run_health_checks(self):
         """Run health checks if enough time has passed."""
@@ -330,6 +343,22 @@ class ProxyManager:
             logger.error(f"❌ Lỗi ghi proxy status: {e}")
             raise
     
+    @contextmanager
+    def locks(self):
+        """
+        Context manager for unified lock handling (same as SessionManager).
+        
+        Usage:
+            with self.locks():
+                # ... do work ...
+        """
+        with self.lock:
+            if self.file_lock:
+                with self.file_lock:
+                    yield
+            else:
+                yield
+    
     def checkout_proxy(self, timeout: int = 30) -> Optional[Dict[str, Any]]:
         """
         Intelligent proxy checkout với performance-based selection
@@ -455,14 +484,9 @@ class ProxyManager:
             logger.warning("⚠️ Proxy config thiếu proxy_id, không thể checkin")
             return
         
-        with self.lock:
-            if self.file_lock:
-                with self.file_lock:
-                    self._intelligent_checkin(proxy_id, status)
-                    self._sync_resources_to_file()
-            else:
-                self._intelligent_checkin(proxy_id, status)
-                self._sync_resources_to_file()
+        with self.locks():
+            self._intelligent_checkin(proxy_id, status)
+            self._sync_resources_to_file()
     
     def _intelligent_checkin(self, proxy_id: str, status: str):
         """Intelligent checkin với performance tracking."""
@@ -582,22 +606,35 @@ class ProxyManager:
             proxies = {"http": proxy_url, "https": proxy_url}
             session.proxies.update(proxies)
             
-            # Test với httpbin.org
-            start_time = time.time()
-            response = session.get("http://httpbin.org/ip", timeout=10)
-            response_time = time.time() - start_time
+            # Test với multiple endpoints (fallback strategy)
+            test_endpoints = [
+                "http://ipinfo.io/json",  # More reliable for proxy testing
+                "http://httpbin.org/ip",  # Fallback
+                "http://www.facebook.com"  # Final fallback - just check connectivity
+            ]
             
-            # Update response time in metadata
-            if proxy_id and proxy_id in self.resource_pool:
-                self.resource_pool[proxy_id].metadata["response_time"] = response_time
-                self.resource_pool[proxy_id].metadata["last_checked"] = datetime.now().isoformat()
+            for endpoint in test_endpoints:
+                try:
+                    start_time = time.time()
+                    response = session.get(endpoint, timeout=10, allow_redirects=False)
+                    response_time = time.time() - start_time
+                    
+                    # Update response time in metadata
+                    if proxy_id and proxy_id in self.resource_pool:
+                        self.resource_pool[proxy_id].metadata["response_time"] = response_time
+                        self.resource_pool[proxy_id].metadata["last_checked"] = datetime.now().isoformat()
+                    
+                    # Accept 200, 301, 302 as success
+                    if response.status_code in [200, 301, 302]:
+                        logger.debug(f"✅ Proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Endpoint {endpoint} failed for {proxy_id}: {str(e)[:50]}")
+                    continue
             
-            if response.status_code == 200:
-                logger.debug(f"✅ Proxy health check OK: {proxy_id} ({response_time:.2f}s)")
-                return True
-            else:
-                logger.warning(f"⚠️ Proxy health check failed: {proxy_id} - Status {response.status_code}")
-                return False
+            # All endpoints failed
+            logger.warning(f"⚠️ Proxy health check failed: {proxy_id} - All test endpoints failed")
+            return False
                 
         except Exception as e:
             logger.warning(f"⚠️ Proxy health check error: {proxy_id} - {e}")
@@ -606,6 +643,8 @@ class ProxyManager:
     async def health_check_proxy_async(self, proxy_config: Dict[str, Any]) -> bool:
         """
         ASYNC version of health check - non-blocking for Celery workers
+        
+        FIX: Removed fallback to sync version to prevent blocking event loop.
         
         Args:
             proxy_config: Config dict của proxy
@@ -631,25 +670,39 @@ class ProxyManager:
                 else:
                     proxy_url = f"http://{proxy_config['username']}:{proxy_config['password']}@{proxy_config['host']}:{proxy_config['port']}"
             
-            # Async HTTP request
+            # Test with multiple endpoints (fallback strategy)
+            test_endpoints = [
+                "http://ipinfo.io/json",
+                "http://httpbin.org/ip",
+                "http://www.facebook.com"
+            ]
+            
             start_time = time.time()
             timeout = aiohttp.ClientTimeout(total=10)
             
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get("http://httpbin.org/ip", proxy=proxy_url) as response:
-                    response_time = time.time() - start_time
-                    
-                    # Update response time in metadata
-                    if proxy_id and proxy_id in self.resource_pool:
-                        self.resource_pool[proxy_id].metadata["response_time"] = response_time
-                        self.resource_pool[proxy_id].metadata["last_checked"] = datetime.now().isoformat()
-                    
-                    if response.status == 200:
-                        logger.debug(f"✅ Async proxy health check OK: {proxy_id} ({response_time:.2f}s)")
-                        return True
-                    else:
-                        logger.warning(f"⚠️ Async proxy health check failed: {proxy_id} - Status {response.status}")
-                        return False
+                # Try each endpoint
+                for endpoint in test_endpoints:
+                    try:
+                        async with session.get(endpoint, proxy=proxy_url, allow_redirects=False) as response:
+                            response_time = time.time() - start_time
+                            
+                            # Update response time in metadata
+                            if proxy_id and proxy_id in self.resource_pool:
+                                self.resource_pool[proxy_id].metadata["response_time"] = response_time
+                                self.resource_pool[proxy_id].metadata["last_checked"] = datetime.now().isoformat()
+                            
+                            # Accept 200, 301, 302 as success
+                            if response.status in [200, 301, 302]:
+                                logger.debug(f"✅ Async proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
+                                return True
+                    except Exception as e:
+                        logger.debug(f"Endpoint {endpoint} failed for {proxy_id}: {str(e)[:50]}")
+                        continue
+                
+                # All endpoints failed
+                logger.warning(f"⚠️ Async proxy health check failed: {proxy_id} - All test endpoints failed")
+                return False
                         
         except Exception as e:
             logger.warning(f"⚠️ Async proxy health check error: {proxy_id} - {e}")
@@ -737,22 +790,17 @@ class ProxyManager:
     
     def reset_all_proxies(self):
         """Reset tất cả proxies về trạng thái READY (debug only)"""
-        with self.lock:
+        with self.locks():
             for resource in self.resource_pool.values():
                 resource.status = "READY"
                 resource.consecutive_failures = 0
                 resource.quarantine_until_timestamp = None
                 resource.quarantine_reason = None
             
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
-            
+            self._sync_resources_to_file()
             logger.info("🔄 Reset tất cả proxies về READY")
     
-    def report_outcome(self, proxy_id: str, outcome: str, details: Dict[str, Any] = None):
+    def report_outcome(self, proxy_id: str, outcome: str, details: Optional[Dict[str, Any]] = None) -> None:
         """
         Báo cáo kết quả task để cập nhật performance metrics cho proxy
         
@@ -760,8 +808,11 @@ class ProxyManager:
             proxy_id: ID của proxy
             outcome: 'success' hoặc 'failure'
             details: Thông tin chi tiết về task (có thể chứa response_time)
+            
+        Returns:
+            None
         """
-        with self.lock:
+        with self.locks():
             if proxy_id not in self.resource_pool:
                 logger.warning(f"⚠️ Proxy không tồn tại để report outcome: {proxy_id}")
                 return
@@ -794,11 +845,7 @@ class ProxyManager:
                 self.quarantine_resource(proxy_id, f"Performance threshold exceeded: {resource.consecutive_failures} consecutive failures, {resource.success_rate:.2f} success rate")
             
             # Sync to file
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
+            self._sync_resources_to_file()
     
     def quarantine_resource(self, proxy_id: str, reason: str = "Performance issues"):
         """
@@ -808,7 +855,7 @@ class ProxyManager:
             proxy_id: ID của proxy
             reason: Lý do cách ly
         """
-        with self.lock:
+        with self.locks():
             if proxy_id not in self.resource_pool:
                 logger.warning(f"⚠️ Proxy không tồn tại để quarantine: {proxy_id}")
                 return
@@ -822,11 +869,7 @@ class ProxyManager:
             logger.warning(f"🚨 Proxy {proxy_id} quarantined until {resource.quarantine_until_timestamp.strftime('%H:%M:%S')} - {reason}")
             
             # Sync to file
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
+            self._sync_resources_to_file()
     
     def get_proxy_performance(self, proxy_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -892,26 +935,108 @@ class ProxyManager:
             
             return result
     
-    def check_cooldowns(self):
+    def check_cooldowns(self) -> int:
         """
-        Public method để kiểm tra và xử lý cooldowns (có thể gọi từ scheduler)
+        Public method để kiểm tra và xử lý cooldowns (có thể gọi từ scheduler).
+        
+        Returns:
+            Number of proxies released from quarantine
         """
-        with self.lock:
-            self._process_cooldowns()
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
+        with self.locks():
+            released_count = self._process_cooldowns()
+            self._sync_resources_to_file()
+            return released_count
 
 
+    def reload_proxies_from_file(self):
+        """
+        🔄 Reload proxies from file và update resource pool
+        
+        Useful khi user cập nhật proxies.txt
+        """
+        logger.info("🔄 Reloading proxies from file...")
+        
+        with self.locks():
+            # Load proxies from file
+            new_proxies = self._load_proxies_from_file()
+            
+            if not new_proxies:
+                logger.warning("⚠️ No proxies found in file")
+                return {'added': 0, 'removed': 0, 'total': len(self.resource_pool)}
+            
+            # Track changes
+            added_count = 0
+            removed_count = 0
+            
+            # Create set of new proxy configs (unique identifier)
+            new_proxy_configs = {
+                f"{p['host']}:{p['port']}" for p in new_proxies
+            }
+            
+            # Remove proxies no longer in file
+            proxy_ids_to_remove = []
+            for proxy_id, resource in self.resource_pool.items():
+                config = resource.metadata.get("config", {})
+                config_id = f"{config.get('host')}:{config.get('port')}"
+                
+                if config_id not in new_proxy_configs:
+                    proxy_ids_to_remove.append(proxy_id)
+            
+            for proxy_id in proxy_ids_to_remove:
+                del self.resource_pool[proxy_id]
+                removed_count += 1
+                logger.info(f"🗑️ Removed proxy: {proxy_id}")
+            
+            # Add new proxies
+            existing_configs = {
+                f"{r.metadata.get('config', {}).get('host')}:{r.metadata.get('config', {}).get('port')}"
+                for r in self.resource_pool.values()
+            }
+            
+            for i, proxy in enumerate(new_proxies):
+                config_id = f"{proxy['host']}:{proxy['port']}"
+                
+                if config_id not in existing_configs:
+                    # Generate new proxy_id
+                    proxy_id = f"proxy_{len(self.resource_pool) + 1}"
+                    
+                    # Create new resource
+                    resource = ManagedResource(proxy_id, "proxy")
+                    resource.status = "READY"
+                    resource.metadata = {
+                        "config": proxy,
+                        "last_checked": None,
+                        "response_time": None
+                    }
+                    
+                    self.resource_pool[proxy_id] = resource
+                    added_count += 1
+                    logger.info(f"➕ Added new proxy: {proxy_id} ({config_id})")
+            
+            # Sync to file
+            self._sync_resources_to_file()
+            
+            logger.info(f"✅ Proxy reload completed: +{added_count} -{removed_count} = {len(self.resource_pool)} total")
+            
+            return {
+                'added': added_count,
+                'removed': removed_count,
+                'total': len(self.resource_pool)
+            }
+    
     def run_comprehensive_health_check(self):
         """
         Chạy health check toàn diện cho tất cả proxies (sử dụng cho maintenance)
+        
+        ENHANCED: Reload proxies từ file trước khi check
         """
         logger.info("🛠️ Bắt đầu comprehensive health check cho tất cả proxies")
         
-        with self.lock:
+        # Reload proxies from file first
+        reload_result = self.reload_proxies_from_file()
+        logger.info(f"📥 Reloaded proxies: {reload_result}")
+        
+        with self.locks():
             checked_count = 0
             healthy_count = 0
             
@@ -935,18 +1060,15 @@ class ProxyManager:
                         checked_count += 1
             
             # Sync results to file
-            if self.file_lock:
-                with self.file_lock:
-                    self._sync_resources_to_file()
-            else:
-                self._sync_resources_to_file()
+            self._sync_resources_to_file()
             
             logger.info(f"✅ Comprehensive health check hoàn thành: {healthy_count}/{checked_count} proxies healthy")
             
             return {
                 "checked_count": checked_count,
                 "healthy_count": healthy_count,
-                "unhealthy_count": checked_count - healthy_count
+                "unhealthy_count": checked_count - healthy_count,
+                "reload_stats": reload_result
             }
 
 

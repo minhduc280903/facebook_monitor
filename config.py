@@ -128,6 +128,75 @@ class WorkerConfig(BaseSettings):
     }
 
 
+class ResourceManagementConfig(BaseSettings):
+    """Configuration cho Session và Proxy resource management"""
+    
+    # Session thresholds
+    session_failure_threshold: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Consecutive failures before session quarantine"
+    )
+    session_success_rate_threshold: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Minimum success rate for sessions"
+    )
+    session_quarantine_minutes: int = Field(
+        default=60,
+        ge=1,
+        description="Session quarantine duration in minutes"
+    )
+    
+    # Proxy thresholds (có thể khác session)
+    proxy_failure_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Consecutive failures before proxy quarantine"
+    )
+    proxy_success_rate_threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Minimum success rate for proxies"
+    )
+    proxy_quarantine_minutes: int = Field(
+        default=30,
+        ge=1,
+        description="Proxy quarantine duration in minutes"
+    )
+    
+    # Common thresholds
+    min_tasks_for_rate_calc: int = Field(
+        default=10,
+        ge=1,
+        description="Minimum tasks before calculating success rate"
+    )
+    
+    # File sync optimization
+    file_sync_interval_seconds: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum interval between file syncs"
+    )
+    file_sync_change_threshold: int = Field(
+        default=10,
+        ge=1,
+        description="Number of changes before forcing file sync"
+    )
+
+    model_config = {
+        "env_prefix": "RESOURCE_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore"
+    }
+
+
 class CircuitBreakerConfig(BaseSettings):
     """Circuit breaker configuration"""
 
@@ -300,6 +369,7 @@ class Settings(BaseSettings):
     circuit_breaker: CircuitBreakerConfig = CircuitBreakerConfig()
     redis: RedisConfig = RedisConfig()
     scraping: ScrapingConfig = ScrapingConfig()
+    resource_management: ResourceManagementConfig = ResourceManagementConfig()
 
     model_config = {
         "env_file": ".env",

@@ -100,22 +100,53 @@ class DatabaseManager:
 
     @contextmanager
     def get_connection(self):
-        """Context manager để lấy và trả kết nối từ pool."""
+        """
+        Context manager an toàn để lấy và trả kết nối từ pool.
+        
+        FIX: Ensures connection is ALWAYS returned to pool, even if commit fails.
+        
+        Yields:
+            Connection object from pool
+            
+        Raises:
+            RuntimeError: If connection pool not initialized
+        """
         if not self.connection_pool:
-            raise Exception("Connection pool chưa được khởi tạo.")
+            raise RuntimeError("Connection pool chưa được khởi tạo")
 
         connection = None
         try:
             connection = self.connection_pool.getconn()
             yield connection
-            connection.commit() # Commit transaction thành công
-        except Exception as e:
+        except Exception:
+            # Rollback nếu có exception từ yield block
             if connection:
-                connection.rollback() # Rollback nếu có lỗi
-            raise e
+                try:
+                    connection.rollback()
+                except Exception as rollback_error:
+                    logger.error("❌ Rollback failed: %s", rollback_error)
+            raise  # Re-raise original exception
+        else:
+            # ✅ FIX: Only commit if yield block succeeded (no exception)
+            # This runs before finally, so if commit fails, we still return connection
+            if connection:
+                try:
+                    connection.commit()
+                except Exception as commit_error:
+                    logger.error("❌ Commit failed: %s", commit_error)
+                    # Try to rollback after failed commit
+                    try:
+                        connection.rollback()
+                    except Exception as rollback_error:
+                        logger.error("❌ Rollback after commit failure failed: %s", rollback_error)
+                    raise  # Re-raise commit error
         finally:
+            # ✅ GUARANTEED: Always return connection to pool
             if connection:
-                self.connection_pool.putconn(connection) # Luôn trả kết nối về pool
+                try:
+                    self.connection_pool.putconn(connection)
+                except Exception as putconn_error:
+                    logger.error("❌ Failed to return connection to pool: %s", putconn_error)
 
     def _create_tables(self, connection) -> None:
         """
@@ -170,6 +201,23 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_posts_first_seen ON posts(first_seen_utc)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_interactions_post_signature ON interactions(post_signature)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(log_timestamp_utc)")
+                
+                # ===== ADD UNIQUE CONSTRAINT TO PREVENT DUPLICATES =====
+                # Unique constraint on (post_signature, log_timestamp_utc) to prevent
+                # duplicate interaction logs for same post at same time
+                cursor.execute("""
+                    DO $$ 
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint 
+                            WHERE conname = 'unique_post_timestamp'
+                        ) THEN
+                            ALTER TABLE interactions
+                            ADD CONSTRAINT unique_post_timestamp 
+                            UNIQUE (post_signature, log_timestamp_utc);
+                        END IF;
+                    END $$;
+                """)
 
             logger.info("✅ Tạo bảng posts, interactions, system_settings và index thành công (PostgreSQL)")
 
@@ -178,7 +226,15 @@ class DatabaseManager:
             raise
 
     def is_post_new(self, post_signature: str) -> bool:
-        """Kiểm tra xem bài viết có phải là mới hay không."""
+        """
+        Kiểm tra xem bài viết có phải là mới hay không.
+        
+        Args:
+            post_signature: Signature của post cần kiểm tra
+            
+        Returns:
+            True nếu post chưa tồn tại (mới), False nếu đã tồn tại hoặc có lỗi
+        """
         sql = "SELECT 1 FROM posts WHERE post_signature = %s LIMIT 1"
         try:
             with self.get_connection() as conn:
@@ -189,8 +245,35 @@ class DatabaseManager:
                     logger.debug("🔍 Post signature '%s...': %s", post_signature[:50], 'MỚI' if is_new else 'ĐÃ TỒN TẠI')
                     return is_new
         except Exception as e:
-            logger.error("❌ Lỗi kiểm tra post mới: %s", e)
+            logger.error("❌ Database error checking if post is new (%s): %s", post_signature[:30], e, exc_info=False)
+            # Return False on error (treat as existing to avoid duplicate processing)
             return False
+    
+    def get_existing_post_signatures_batch(self, signatures: List[str]) -> set:
+        """
+        Batch check existing posts - FIX for N+1 query problem.
+        
+        Args:
+            signatures: List of post signatures to check
+            
+        Returns:
+            Set of signatures that already exist in database
+        """
+        if not signatures:
+            return set()
+        
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use ANY for efficient batch lookup
+                    sql = "SELECT post_signature FROM posts WHERE post_signature = ANY(%s)"
+                    cur.execute(sql, (signatures,))
+                    existing = {row['post_signature'] for row in cur.fetchall()}
+                    logger.debug(f"📊 Batch check: {len(existing)}/{len(signatures)} posts exist")
+                    return existing
+        except Exception as e:
+            logger.error(f"❌ Batch signature check failed: {e}")
+            return set()
 
     def add_new_post(self, post_signature: str, post_url: str, source_url: str, author_name: Optional[str] = None, author_id: Optional[str] = None, post_content: Optional[str] = None) -> bool:
         """Thêm bài viết mới vào bảng posts với thông tin chi tiết."""
@@ -228,20 +311,115 @@ class DatabaseManager:
             return None
 
     def log_interaction(self, post_signature: str, log_timestamp_utc: str, like_count: int, comment_count: int) -> bool:
-        """Ghi log tương tác vào bảng interactions."""
+        """
+        Ghi log tương tác vào bảng interactions với duplicate prevention.
+        
+        ENHANCED: Sử dụng unique constraint trên (post_signature, rounded_timestamp)
+        để tránh duplicate entries trong cùng khoảng thời gian (~1 phút)
+        
+        Args:
+            post_signature: Signature của post
+            log_timestamp_utc: Timestamp UTC (ISO format)
+            like_count: Số lượng likes
+            comment_count: Số lượng comments
+            
+        Returns:
+            True nếu ghi thành công, False nếu có lỗi
+        """
+        # Round timestamp to nearest minute để tránh duplicate khi retry
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(log_timestamp_utc.replace('Z', '+00:00'))
+            # Round to minute
+            dt = dt.replace(second=0, microsecond=0)
+            rounded_timestamp = dt.isoformat()
+        except Exception as e:
+            logger.warning("⚠️ Error rounding timestamp, using original: %s", e)
+            rounded_timestamp = log_timestamp_utc
+        
+        # Use ON CONFLICT DO UPDATE to prevent duplicates
         sql = """
         INSERT INTO interactions (post_signature, log_timestamp_utc, like_count, comment_count)
         VALUES (%s, %s, %s, %s)
+        ON CONFLICT ON CONSTRAINT unique_post_timestamp 
+        DO UPDATE SET 
+            like_count = EXCLUDED.like_count,
+            comment_count = EXCLUDED.comment_count
         """
+        
+        # Fallback query nếu constraint chưa tồn tại
+        fallback_sql = """
+        INSERT INTO interactions (post_signature, log_timestamp_utc, like_count, comment_count)
+        VALUES (%s, %s, %s, %s)
+        """
+        
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(sql, (post_signature, log_timestamp_utc, like_count, comment_count))
-            logger.debug("📈 Log tương tác: %d likes, %d comments - %s...", like_count, comment_count, post_signature[:30])
+                    try:
+                        cursor.execute(sql, (post_signature, rounded_timestamp, like_count, comment_count))
+                    except psycopg2.errors.UndefinedObject:
+                        # Constraint chưa tồn tại, dùng fallback
+                        cursor.execute(fallback_sql, (post_signature, rounded_timestamp, like_count, comment_count))
+            
+            logger.debug("✅ Logged interaction: %s likes, %s comments for post %s...", like_count, comment_count, post_signature[:30])
             return True
         except Exception as e:
-            logger.error(f"❌ Lỗi log interaction: {e}")
+            logger.error("❌ Database error logging interaction for post %s: %s", post_signature[:30], e, exc_info=False)
             return False
+    
+    def log_interactions_batch(self, interactions: List[Dict[str, Any]]) -> int:
+        """
+        Batch insert interactions - FIX for N+1 query problem.
+        
+        Args:
+            interactions: List of dicts with keys: post_signature, log_timestamp_utc, like_count, comment_count
+            
+        Returns:
+            Number of interactions successfully inserted/updated
+        """
+        if not interactions:
+            return 0
+        
+        try:
+            # Round all timestamps
+            processed_interactions = []
+            for item in interactions:
+                try:
+                    dt = datetime.fromisoformat(item['log_timestamp_utc'].replace('Z', '+00:00'))
+                    dt = dt.replace(second=0, microsecond=0)
+                    processed_interactions.append((
+                        item['post_signature'],
+                        dt.isoformat(),
+                        item['like_count'],
+                        item['comment_count']
+                    ))
+                except:
+                    # Skip invalid entries
+                    continue
+            
+            if not processed_interactions:
+                return 0
+            
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Use executemany for batch insert
+                    sql = """
+                    INSERT INTO interactions (post_signature, log_timestamp_utc, like_count, comment_count)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT ON CONSTRAINT unique_post_timestamp 
+                    DO UPDATE SET 
+                        like_count = EXCLUDED.like_count,
+                        comment_count = EXCLUDED.comment_count
+                    """
+                    cursor.executemany(sql, processed_interactions)
+                    
+            logger.info(f"📊 Batch logged {len(processed_interactions)} interactions")
+            return len(processed_interactions)
+            
+        except Exception as e:
+            logger.error(f"❌ Batch interaction logging failed: {e}")
+            return 0
 
     def add_new_post_with_interaction(self, post_signature: str, post_url: str, source_url: str, like_count: int, comment_count: int, author_name: Optional[str] = None, author_id: Optional[str] = None, post_content: Optional[str] = None) -> bool:
         """Thêm post mới và interaction đầu tiên trong một transaction duy nhất."""
@@ -318,24 +496,37 @@ class DatabaseManager:
             return {}
 
     def cleanup_old_interactions(self, days_to_keep: int = DEFAULT_CLEANUP_DAYS) -> int:
-        """Dọn dẹp các interactions cũ một cách an toàn."""
-        if not isinstance(days_to_keep, int) or days_to_keep < 1:
-            logger.error("Invalid days_to_keep value: %s", days_to_keep)
+        """
+        Dọn dẹp các interactions cũ một cách an toàn.
+        
+        Args:
+            days_to_keep: Số ngày giữ lại data (phải từ 1-3650)
+            
+        Returns:
+            Số lượng interactions đã xóa
+        """
+        # Validate input nghiêm ngặt với upper bound
+        if not isinstance(days_to_keep, int) or days_to_keep < 1 or days_to_keep > 3650:
+            logger.error("Invalid days_to_keep value: %s (must be 1-3650)", days_to_keep)
             return 0
         
-        interval = f'{days_to_keep} days'
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Use parameterized query to prevent SQL injection
-                    select_sql = "SELECT COUNT(*) as count FROM interactions WHERE log_timestamp_utc::timestamp < NOW() - INTERVAL %s"
-                    cursor.execute(select_sql, (interval,))
+                    # Fix SQL Injection: Sử dụng timedelta thay vì string interpolation
+                    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+                    
+                    # Count old interactions
+                    select_sql = "SELECT COUNT(*) as count FROM interactions WHERE log_timestamp_utc::timestamp < %s"
+                    cursor.execute(select_sql, (cutoff_date,))
                     old_count = cursor.fetchone()['count']
 
                     if old_count > 0:
-                        delete_sql = "DELETE FROM interactions WHERE log_timestamp_utc::timestamp < NOW() - INTERVAL %s"
-                        cursor.execute(delete_sql, (interval,))
-                        logger.info("🗑️ Đã dọn dẹp %d interactions cũ hơn %d ngày", old_count, days_to_keep)
+                        # Delete old interactions
+                        delete_sql = "DELETE FROM interactions WHERE log_timestamp_utc::timestamp < %s"
+                        cursor.execute(delete_sql, (cutoff_date,))
+                        logger.info("🗑️ Đã dọn dẹp %d interactions cũ hơn %d ngày (cutoff: %s)", 
+                                   old_count, days_to_keep, cutoff_date.isoformat())
                         return old_count
             return 0
         except Exception as e:

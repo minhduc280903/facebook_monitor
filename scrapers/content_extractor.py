@@ -282,77 +282,60 @@ class ContentExtractor:
     
     def _extract_count_from_text(self, text: str) -> int:
         """
-        Extracts a numerical count from a string, handling suffixes like 'K' and 'M'.
-        Special handling for "All reactions:X" pattern.
+        Extracts numerical count from text, handling suffixes like 'K' and 'M'.
+        
+        Refactored: Sử dụng pattern list thay vì duplicate logic.
+        
+        Args:
+            text: Text chứa count
+            
+        Returns:
+            Số count (int)
         """
         if not text:
             return 0
         
         text_lower = text.lower().strip()
         
-        # 🎯 PRIORITY: Handle "All reactions:X" pattern (total reactions)
-        all_reactions_match = re.search(r'all reactions?:\s*(\d+[\.,]?\d*)([km]?)', text_lower)
-        if all_reactions_match:
-            logger.info(f"🎯 Found 'All reactions:' pattern in text: '{text[:100]}'")
-            value_str, suffix = all_reactions_match.groups()
-            try:
-                value_str = value_str.replace(',', '.')
-                count = float(value_str)
-                
-                if suffix == 'k':
-                    count *= 1_000
-                elif suffix == 'm':
-                    count *= 1_000_000
-                
-                result = int(count)
-                logger.info(f"🎯 Extracted total reactions: {result}")
-                return result
-            except (ValueError, TypeError):
-                logger.warning(f"🎯 Failed to parse All reactions number: {value_str}")
+        # Danh sách patterns theo thứ tự ưu tiên
+        patterns = [
+            r'all reactions?:\s*(\d+[\.,]?\d*)([km]?)',        # English "All reactions:123"
+            r'tất cả cảm xúc:\s*(\d+[\.,]?\d*)([km]?)',       # Vietnamese
+            r'(\d+[\.,]?\d*)([km]?)\s*(?:likes?|reactions?)', # "123K likes"
+            r'(\d+[\.,]?\d*)([km]?)'                          # Fallback: any number
+        ]
         
-        # Handle Vietnamese pattern "Tất cả cảm xúc:X"
-        vietnamese_match = re.search(r'tất cả cảm xúc:\s*(\d+[\.,]?\d*)([km]?)', text_lower)
-        if vietnamese_match:
-            logger.info(f"🇻🇳 Found Vietnamese 'Tất cả cảm xúc:' pattern")
-            value_str, suffix = vietnamese_match.groups()
-            try:
-                value_str = value_str.replace(',', '.')
-                count = float(value_str)
-                
-                if suffix == 'k':
-                    count *= 1_000
-                elif suffix == 'm':
-                    count *= 1_000_000
-                
-                result = int(count)
-                logger.info(f"🇻🇳 Extracted Vietnamese total reactions: {result}")
-                return result
-            except (ValueError, TypeError):
-                logger.warning(f"🇻🇳 Failed to parse Vietnamese reaction number: {value_str}")
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                try:
+                    result = self._parse_number_with_suffix(match)
+                    logger.debug(f"✅ Extracted count from '{text[:50]}...': {result}")
+                    return result
+                except (ValueError, TypeError):
+                    continue  # Thử pattern tiếp theo
         
-        # Fallback: Find all potential numbers, including those with K/M suffixes
-        matches = re.findall(r'(\d+[\.,]?\d*)([km]?)', text_lower)
+        return 0
+    
+    def _parse_number_with_suffix(self, match: re.Match) -> int:
+        """
+        Helper để parse số với suffix K/M.
         
-        if not matches:
-            return 0
-
-        # Prioritize the first match as it's often the main count
-        value_str, suffix = matches[0]
-        
-        try:
-            # Clean the number string
-            value_str = value_str.replace(',', '.')
-            count = float(value_str)
+        Args:
+            match: Regex match object với groups (number, suffix)
             
-            # Apply multiplier based on suffix
-            if suffix == 'k':
-                count *= 1_000
-            elif suffix == 'm':
-                count *= 1_000_000
-            
-            return int(count)
-        except (ValueError, IndexError):
-            return 0
+        Returns:
+            Parsed integer value
+        """
+        value_str, suffix = match.groups()
+        value_str = value_str.replace(',', '.')
+        count = float(value_str)
+        
+        # Apply multiplier
+        multipliers = {'k': 1_000, 'm': 1_000_000}
+        count *= multipliers.get(suffix, 1)
+        
+        return int(count)
     
     def _clean_post_url(self, url: str) -> str:
         """
