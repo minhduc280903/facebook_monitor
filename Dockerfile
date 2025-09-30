@@ -41,7 +41,8 @@ RUN apt-get update && apt-get install -y \
 # Cài đặt các dependencies trước để tận dụng Docker layer caching
 # Copy unified requirements file (Phase 3.2: consolidated all dependencies into one file)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Increase timeout to 300s for slow networks
+RUN pip install --no-cache-dir --timeout=300 -r requirements.txt
 
 # Download browser binaries for Playwright (without deps to avoid font conflicts)
 RUN playwright install chromium
