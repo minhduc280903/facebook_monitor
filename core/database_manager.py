@@ -657,7 +657,15 @@ class DatabaseManager:
             return False
 
     def get_setting(self, key: str) -> Optional[str]:
-        """Lấy một cài đặt hệ thống."""
+        """
+        Lấy một cài đặt hệ thống.
+        
+        Args:
+            key: Key của setting cần lấy
+            
+        Returns:
+            Value của setting hoặc None nếu không tìm thấy
+        """
         sql = "SELECT value FROM system_settings WHERE key = %s"
         try:
             with self.get_connection() as conn:
@@ -665,13 +673,15 @@ class DatabaseManager:
                     cur.execute(sql, (key,))
                     result = cur.fetchone()
                     if result:
-                        logger.debug(f"🔍 Got setting '{key}' = '{result[0]}'")
-                        return result[0]
+                        # FIX: Use dict key instead of index for RealDictCursor
+                        value = result['value']
+                        logger.debug("🔍 Got setting '%s' = '%s'", key, value)
+                        return value
                     else:
-                        logger.debug(f"🔍 Setting '{key}' not found")
+                        logger.debug("🔍 Setting '%s' not found", key)
                         return None
         except Exception as e:
-            logger.error(f"❌ Lỗi khi get setting '{key}': {e}")
+            logger.error("❌ Database error getting setting '%s': %s", key, e, exc_info=False)
             return None
 
     def _get_placeholder(self) -> str:
