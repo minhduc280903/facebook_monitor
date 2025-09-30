@@ -561,17 +561,17 @@ class SessionManager:
                 # Thread + process safe checkout with shorter lock duration
                 with self.lock:
                     if self.file_lock:
-                    # Use timeout on file lock to prevent indefinite blocking
-                    try:
-                        with self.file_lock.acquire(timeout=10):  # Increased to 10 seconds for high-contention environments
-                            result = self._checkout_session_with_bound_proxy(proxy_manager)
-                            if result:
-                                self._sync_resources_to_file()
-                                return result
-                    except Exception as e:
-                        # File lock timeout, continue to next attempt
-                        logger.debug(f"File lock acquire timeout: {e}")
-                        pass
+                        # Use timeout on file lock to prevent indefinite blocking
+                        try:
+                            with self.file_lock.acquire(timeout=10):  # Increased to 10 seconds for high-contention environments
+                                result = self._checkout_session_with_bound_proxy(proxy_manager)
+                                if result:
+                                    self._sync_resources_to_file()
+                                    return result
+                        except Exception as e:
+                            # File lock timeout, continue to next attempt
+                            logger.debug(f"File lock acquire timeout: {e}")
+                            pass
                     else:
                         result = self._checkout_session_with_bound_proxy(proxy_manager)
                         if result:
