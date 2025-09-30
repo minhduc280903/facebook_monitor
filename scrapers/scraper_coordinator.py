@@ -513,27 +513,21 @@ class ScraperCoordinator:
         total_scrolls = 0
         
         logger.info(f"🎯 Starting UNLIMITED scroll mode: max_posts={max_posts:,}, max_time={max_scroll_time/3600:.1f}h")
-        logger.info("📅 Will stop when encountering posts older than start_date (date-based filtering has priority)")
+        logger.info("📅 Will scroll until finding posts older than start_date (date-based filtering in process_url)")
+        logger.info("⚡ No scroll limit - will continue until date filtering stops or no more posts")
 
         while stale_scrolls < 3:
-            # Check time limit (safety mechanism)
+            # Check time limit (safety mechanism only - should rarely trigger)
             elapsed_time = time.time() - start_time
             if elapsed_time > max_scroll_time:
-                logger.warning(f"⏰ Safety time limit reached ({max_scroll_time/3600:.1f} hours). Stopping scroll.")
-                logger.info("💡 Consider increasing max_scroll_time if needed to capture all posts from start_date")
+                logger.warning(f"⏰ SAFETY: Time limit reached ({max_scroll_time/3600:.1f} hours). Stopping scroll.")
+                logger.info("💡 This is a safety mechanism. Normal stop should be from date filtering.")
                 break
                 
-            # Check post count limit (safety mechanism - very high by default)
+            # Check post count limit (safety mechanism only - should rarely trigger)
             if len(post_elements) >= max_posts:
-                logger.warning(f"📊 Safety post limit reached ({max_posts:,} posts). Stopping scroll.")
-                logger.info("💡 Consider increasing max_posts if needed to capture all posts from start_date")
-                break
-            
-            # Check scrolls limit to avoid detection (configurable, default 100)
-            max_scrolls = getattr(self.config, 'max_scrolls_per_session', 100)
-            if total_scrolls >= max_scrolls:
-                logger.warning(f"🛑 Reached max scrolls limit ({max_scrolls}) to avoid detection")
-                logger.info(f"💡 Collected {len(post_elements)} posts so far. Adjust max_scrolls_per_session if needed.")
+                logger.warning(f"📊 SAFETY: Post limit reached ({max_posts:,} posts). Stopping scroll.")
+                logger.info("💡 This is a safety mechanism. Normal stop should be from date filtering.")
                 break
             
             last_post_count = len(post_elements)

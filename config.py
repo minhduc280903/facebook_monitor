@@ -249,10 +249,6 @@ class ScrapingConfig(BaseSettings):
         default=20,
         description="Maximum requests per minute per session"
     )
-    max_scrolls_per_session: int = Field(
-        default=100,
-        description="Maximum scroll operations per session to avoid detection"
-    )
     
     post_processing_delay_min: float = Field(
         default=0.5,
