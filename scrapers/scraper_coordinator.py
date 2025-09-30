@@ -489,15 +489,14 @@ class ScraperCoordinator:
         """
         Scrolls to load posts with intelligent stopping conditions.
 
-        OPTIMIZED: Uses memory-efficient approach by not collecting all elements at once.
-        Returns only the currently visible elements for processing.
+        UNLIMITED MODE: Will scroll until date-based filtering stops or safety limits reached.
         
         Args:
             max_posts: Maximum posts to load before stopping (None = use config)
             max_scroll_time: Maximum time to spend scrolling in seconds (None = use config)
 
         Returns:
-            A list of currently visible post elements on the page.
+            A list of all post elements found on the page.
         """
         import time
         
@@ -507,18 +506,13 @@ class ScraperCoordinator:
         if max_scroll_time is None:
             max_scroll_time = self.config.max_scroll_hours * 3600
         
-        # OPTIMIZATION: Limit collected elements to reasonable batch size to prevent memory issues
-        # We'll scroll until we have enough posts, but not collect infinite elements
-        MAX_ELEMENTS_IN_MEMORY = 500  # Keep max 500 elements in memory at once
-        
         start_time = time.time()
         post_elements = await self.navigation_handler.find_post_elements(self.content_extractor)
         last_post_count = 0
         stale_scrolls = 0
         total_scrolls = 0
         
-        logger.info(f"🎯 Starting optimized scroll with memory limits: max_posts={min(max_posts, MAX_ELEMENTS_IN_MEMORY)}, max_time={max_scroll_time/3600:.1f}h")
-        logger.info(f"💾 Memory optimization: Keeping max {MAX_ELEMENTS_IN_MEMORY} elements in memory")
+        logger.info(f"🎯 Starting UNLIMITED scroll mode: max_posts={max_posts:,}, max_time={max_scroll_time/3600:.1f}h")
         logger.info("📅 Will stop when encountering posts older than start_date (date-based filtering has priority)")
 
         while stale_scrolls < 3:
@@ -529,16 +523,17 @@ class ScraperCoordinator:
                 logger.info("💡 Consider increasing max_scroll_time if needed to capture all posts from start_date")
                 break
                 
-            # OPTIMIZATION: Check memory limit instead of unlimited post count
-            if len(post_elements) >= MAX_ELEMENTS_IN_MEMORY:
-                logger.info(f"💾 Reached memory-efficient batch size ({MAX_ELEMENTS_IN_MEMORY} posts). Returning for processing.")
-                logger.info("🔄 Additional posts will be loaded in next scroll cycle")
+            # Check post count limit (safety mechanism - very high by default)
+            if len(post_elements) >= max_posts:
+                logger.warning(f"📊 Safety post limit reached ({max_posts:,} posts). Stopping scroll.")
+                logger.info("💡 Consider increasing max_posts if needed to capture all posts from start_date")
                 break
             
-            # Check scrolls limit to avoid detection
+            # Check scrolls limit to avoid detection (configurable, default 100)
             max_scrolls = getattr(self.config, 'max_scrolls_per_session', 100)
             if total_scrolls >= max_scrolls:
                 logger.warning(f"🛑 Reached max scrolls limit ({max_scrolls}) to avoid detection")
+                logger.info(f"💡 Collected {len(post_elements)} posts so far. Adjust max_scrolls_per_session if needed.")
                 break
             
             last_post_count = len(post_elements)
@@ -564,7 +559,6 @@ class ScraperCoordinator:
 
         elapsed_total = time.time() - start_time
         logger.info(f"✅ Finished scrolling. Found {len(post_elements)} posts in {elapsed_total:.1f}s ({total_scrolls} scrolls)")
-        logger.info(f"💾 Memory-efficient: Returned batch of {len(post_elements)} posts for processing")
         return post_elements
 
     async def _extract_post_details(self, post_element) -> Optional[Dict[str, Any]]:
