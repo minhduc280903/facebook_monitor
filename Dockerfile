@@ -39,11 +39,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Cài đặt các dependencies trước để tận dụng Docker layer caching
-# Copy file requirements của backend và webapp và cài đặt
-COPY backend_requirements.txt .
-COPY webapp_streamlit/requirements.txt ./webapp_requirements.txt
-RUN pip install --no-cache-dir -r backend_requirements.txt
-RUN pip install --no-cache-dir -r webapp_requirements.txt
+# Copy unified requirements file (Phase 3.2: consolidated all dependencies into one file)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Download browser binaries for Playwright (without deps to avoid font conflicts)
 RUN playwright install chromium
