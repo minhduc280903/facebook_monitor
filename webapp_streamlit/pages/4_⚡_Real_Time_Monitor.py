@@ -41,15 +41,15 @@ class WebSocketManager:
     """Quản lý kết nối API (đơn giản hóa cho ví dụ này)."""
     
     def __init__(self, api_base_url: Optional[str] = None):
-        # Read from environment variable for Docker, fallback for local dev
-        self.api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
+        # FIXED: Use container name for backend calls in Docker environment
+        self.api_base_url = os.getenv("API_BASE_URL", "http://facebook-monitor-api:8000")
         if api_base_url:  # Allow overriding for specific instances
             self.api_base_url = api_base_url
     
     def check_api_health(self):
         """Kiểm tra xem server API có đang chạy không."""
         try:
-            response = requests.get(f"{self.api_base_url}/api/health", timeout=5)
+            response = requests.get(f"{self.api_base_url}/health", timeout=5)
             return response.status_code == 200
         except requests.RequestException:
             return False
@@ -235,18 +235,16 @@ def render_simple_engagement_chart(interactions_data: list, chart_id: str = "eng
                 }},
             }});
             
-            // Likes Line Series (Green) - đúng theo TradingView docs
-            const likesSeries = chart.addSeries(LightweightCharts.LineSeries);
-            likesSeries.applyOptions({{
+            // Likes Line Series (Green) - FIXED: Use addLineSeries method directly
+            const likesSeries = chart.addLineSeries({{
                 color: '#00ff88',
                 lineWidth: 3,
                 priceLineVisible: false,
                 lastValueVisible: true,
             }});
             
-            // Comments Line Series (Red) - đúng theo TradingView docs  
-            const commentsSeries = chart.addSeries(LightweightCharts.LineSeries);
-            commentsSeries.applyOptions({{
+            // Comments Line Series (Red) - FIXED: Use addLineSeries method directly  
+            const commentsSeries = chart.addLineSeries({{
                 color: '#ff6b6b', 
                 lineWidth: 3,
                 priceLineVisible: false,

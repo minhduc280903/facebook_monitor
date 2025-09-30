@@ -23,14 +23,14 @@ from typing import Dict, List, Any, Optional
 # Constants for browser configuration
 DEFAULT_USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 )
-DEFAULT_VIEWPORT_WIDTH = 1366
-DEFAULT_VIEWPORT_HEIGHT = 768
+DEFAULT_VIEWPORT_WIDTH = 1920
+DEFAULT_VIEWPORT_HEIGHT = 1080
 DEFAULT_LOCALE = 'vi-VN'
 DEFAULT_TIMEZONE = 'Asia/Ho_Chi_Minh'
 MOCK_PLUGINS_COUNT = 5
-FINGERPRINT_VERSION = "v2.5_unified"
+FINGERPRINT_VERSION = "v2.6_enhanced_persistence"
 
 
 def get_browser_args() -> List[str]:
@@ -68,7 +68,8 @@ def get_browser_args() -> List[str]:
 def get_browser_launch_options(
     user_data_dir: str,
     headless: bool = False,
-    proxy_config: Optional[Dict[str, Any]] = None
+    proxy_config: Optional[Dict[str, Any]] = None,
+    docker_mode: bool = False
 ) -> Dict[str, Any]:
     """
     Trả về dict chứa TẤT CẢ các tùy chọn khởi động trình duyệt.
@@ -86,6 +87,22 @@ def get_browser_launch_options(
     
     args = get_browser_args()
 
+    # 🐳 DOCKER-SPECIFIC ARGS: Add stability flags for container environment
+    if docker_mode:
+        docker_args = [
+            '--disable-dev-shm-usage',
+            '--disable-extensions',
+            '--disable-background-timer-throttling',
+            '--disable-features=Translate,BackForwardCache',
+            '--no-default-browser-check',
+            '--disable-software-rasterizer',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--metrics-recording-only'
+        ]
+        args.extend(docker_args)
+    
     # 🔥 QUAN TRỌNG: Headless mode handling
     if headless:
         args.append('--headless=new')  # Use new headless mode
@@ -104,7 +121,13 @@ def get_browser_launch_options(
         "timezone_id": DEFAULT_TIMEZONE,
         "java_script_enabled": True,
         "bypass_csp": True,
-        "ignore_https_errors": True
+        "ignore_https_errors": True,
+        # ENHANCED: Cookie persistence options
+        "accept_downloads": True,
+        # ENHANCED: Viewport consistency 
+        "device_scale_factor": 1.0,
+        "is_mobile": False,
+        "has_touch": False
     }
     
     # 🔧 PRODUCTION FIX: Tích hợp ProxyManager

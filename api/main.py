@@ -28,7 +28,7 @@ sys.path.append(
 # Import after sys.path modification
 from logging_config import get_logger, setup_application_logging
 from core.database_manager import DatabaseManager
-from multi_queue_config import MultiQueueConfig
+# MIGRATION: Removed multi_queue_config dependency - now using Celery
 from config import settings  # <--- IMPORT SETTINGS
 
 from fastapi import (
@@ -268,12 +268,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         try:
                             stats = db_manager.get_stats()
                             
-                            # Add queue stats if Redis available
+                            # Add Celery queue stats if Redis available
                             if redis_client:
                                 try:
-                                    for queue_type in MultiQueueConfig.get_all_queues():
-                                        queue_length = await redis_client.llen(queue_type.value)
-                                        stats[f"{queue_type.name.lower()}_queue_length"] = queue_length
+                                    # MIGRATION: Updated to use Celery queue names
+                                    celery_queues = ["scan_high", "scan_normal", "discovery", "maintenance"]
+                                    for queue_name in celery_queues:
+                                        queue_length = await redis_client.llen(queue_name)
+                                        stats[f"{queue_name}_queue_length"] = queue_length
                                 except Exception as e:
                                     logger.warning(f"⚠️ Could not get queue stats: {e}")
                             
@@ -358,13 +360,15 @@ async def get_system_stats(
     try:
         stats = db.get_stats()
         
-        # Add queue stats
-        for queue_type in MultiQueueConfig.get_all_queues():
+        # Add Celery queue stats
+        # MIGRATION: Updated to use Celery queue names
+        celery_queues = ["scan_high", "scan_normal", "discovery", "maintenance"]
+        for queue_name in celery_queues:
             try:
-                queue_length = await redis.llen(queue_type.value)
-                stats[f"{queue_type.name.lower()}_queue_length"] = queue_length
+                queue_length = await redis.llen(queue_name)
+                stats[f"{queue_name}_queue_length"] = queue_length
             except Exception:
-                stats[f"{queue_type.name.lower()}_queue_length"] = 0
+                stats[f"{queue_name}_queue_length"] = 0
         
         return {"stats": stats}
         

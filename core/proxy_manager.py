@@ -550,7 +550,9 @@ class ProxyManager:
     
     def health_check_proxy(self, proxy_config: Dict[str, Any]) -> bool:
         """
-        Enhanced health check với response time tracking
+        Enhanced health check với response time tracking (synchronous version for compatibility)
+        
+        For async operations, use health_check_proxy_async() instead.
         
         Args:
             proxy_config: Config dict của proxy
@@ -599,6 +601,58 @@ class ProxyManager:
                 
         except Exception as e:
             logger.warning(f"⚠️ Proxy health check error: {proxy_id} - {e}")
+            return False
+    
+    async def health_check_proxy_async(self, proxy_config: Dict[str, Any]) -> bool:
+        """
+        ASYNC version of health check - non-blocking for Celery workers
+        
+        Args:
+            proxy_config: Config dict của proxy
+            
+        Returns:
+            True nếu proxy hoạt động tốt, False nếu có vấn đề
+        """
+        proxy_id = proxy_config.get("proxy_id")
+        
+        try:
+            import aiohttp
+            
+            # Build proxy URL
+            if proxy_config.get("type") == "socks5":
+                proxy_url = f"socks5://{proxy_config['host']}:{proxy_config['port']}"
+            else:
+                proxy_url = f"http://{proxy_config['host']}:{proxy_config['port']}"
+            
+            # Add authentication if available
+            if proxy_config.get("username") and proxy_config.get("password"):
+                if proxy_config.get("type") == "socks5":
+                    proxy_url = f"socks5://{proxy_config['username']}:{proxy_config['password']}@{proxy_config['host']}:{proxy_config['port']}"
+                else:
+                    proxy_url = f"http://{proxy_config['username']}:{proxy_config['password']}@{proxy_config['host']}:{proxy_config['port']}"
+            
+            # Async HTTP request
+            start_time = time.time()
+            timeout = aiohttp.ClientTimeout(total=10)
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get("http://httpbin.org/ip", proxy=proxy_url) as response:
+                    response_time = time.time() - start_time
+                    
+                    # Update response time in metadata
+                    if proxy_id and proxy_id in self.resource_pool:
+                        self.resource_pool[proxy_id].metadata["response_time"] = response_time
+                        self.resource_pool[proxy_id].metadata["last_checked"] = datetime.now().isoformat()
+                    
+                    if response.status == 200:
+                        logger.debug(f"✅ Async proxy health check OK: {proxy_id} ({response_time:.2f}s)")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ Async proxy health check failed: {proxy_id} - Status {response.status}")
+                        return False
+                        
+        except Exception as e:
+            logger.warning(f"⚠️ Async proxy health check error: {proxy_id} - {e}")
             return False
     
     def get_stats(self) -> Dict[str, Any]:

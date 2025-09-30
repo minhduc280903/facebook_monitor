@@ -82,20 +82,23 @@ class ContentExtractor:
                 if raw_data is not None:
                     # Validate data
                     validation_result = DataValidator.validate_data(raw_data, validation_config, field_name)
-                    
+
                     if validation_result['is_valid']:
                         # Success!
-                        logger.info(f"✅ Field '{field_name}': Strategy #{index+1} ({strategy_type}) succeeded")
-                        
+                        logger.info(f"✅ Field '{field_name}': Strategy #{index+1} ({strategy_type}) succeeded - Value: {validation_result['cleaned_data']}")
+
                         # Track success
                         self._track_strategy_success(field_name, index, strategy_desc)
-                        
+
                         return validation_result['cleaned_data']
                     else:
-                        logger.warning(f"⚠️ Field '{field_name}': Strategy #{index+1} extracted data but validation failed: {validation_result['error_message']}")
+                        logger.warning(f"⚠️ Field '{field_name}': Strategy #{index+1} extracted data but validation failed: {validation_result['error_message']} - Raw data: {raw_data}")
                 else:
-                    # Skip logging author_name failures - user doesn't care
-                    if field_name != 'author_name':
+                    # ENHANCED LOGGING: Always log extraction failures for like_count
+                    if field_name == 'like_count':
+                        logger.warning(f"❌ REACTION EXTRACTION FAILED: Strategy #{index+1} ({strategy_type}) - {strategy_desc}")
+                        logger.warning(f"   Selector: {strategy_path}")
+                    elif field_name != 'author_name':
                         logger.warning(f"⚠️ Field '{field_name}': Strategy #{index+1} failed to extract data")
                     
             except Exception as e:
@@ -128,6 +131,13 @@ class ContentExtractor:
         """
         try:
             if strategy_type == 'css':
+                # 🐳 DOCKER FIX: Add wait for dynamic elements
+                if 'count' in field_name.lower():
+                    try:
+                        await element.wait_for_selector(strategy_path, timeout=3000)
+                    except:
+                        pass  # Continue even if wait fails
+                
                 elements = await element.query_selector_all(strategy_path)
                 
                 # Xử lý khác nhau tùy theo field type
@@ -151,6 +161,13 @@ class ContentExtractor:
                 return text.strip() if text else None
                 
             elif strategy_type == 'xpath':
+                # 🐳 DOCKER FIX: Add wait for XPath elements (reactions are often dynamic)
+                if 'count' in field_name.lower():
+                    try:
+                        await element.wait_for_selector(f"xpath={strategy_path}", timeout=3000)
+                    except:
+                        pass  # Continue even if wait fails
+                
                 # XPath strategy support
                 elements = await element.query_selector_all(f"xpath={strategy_path}")
                 
@@ -266,14 +283,55 @@ class ContentExtractor:
     def _extract_count_from_text(self, text: str) -> int:
         """
         Extracts a numerical count from a string, handling suffixes like 'K' and 'M'.
+        Special handling for "All reactions:X" pattern.
         """
         if not text:
             return 0
         
-        text = text.lower().strip()
+        text_lower = text.lower().strip()
         
-        # Find all potential numbers, including those with K/M suffixes
-        matches = re.findall(r'(\d+[\.,]?\d*)([km]?)', text)
+        # 🎯 PRIORITY: Handle "All reactions:X" pattern (total reactions)
+        all_reactions_match = re.search(r'all reactions?:\s*(\d+[\.,]?\d*)([km]?)', text_lower)
+        if all_reactions_match:
+            logger.info(f"🎯 Found 'All reactions:' pattern in text: '{text[:100]}'")
+            value_str, suffix = all_reactions_match.groups()
+            try:
+                value_str = value_str.replace(',', '.')
+                count = float(value_str)
+                
+                if suffix == 'k':
+                    count *= 1_000
+                elif suffix == 'm':
+                    count *= 1_000_000
+                
+                result = int(count)
+                logger.info(f"🎯 Extracted total reactions: {result}")
+                return result
+            except (ValueError, TypeError):
+                logger.warning(f"🎯 Failed to parse All reactions number: {value_str}")
+        
+        # Handle Vietnamese pattern "Tất cả cảm xúc:X"
+        vietnamese_match = re.search(r'tất cả cảm xúc:\s*(\d+[\.,]?\d*)([km]?)', text_lower)
+        if vietnamese_match:
+            logger.info(f"🇻🇳 Found Vietnamese 'Tất cả cảm xúc:' pattern")
+            value_str, suffix = vietnamese_match.groups()
+            try:
+                value_str = value_str.replace(',', '.')
+                count = float(value_str)
+                
+                if suffix == 'k':
+                    count *= 1_000
+                elif suffix == 'm':
+                    count *= 1_000_000
+                
+                result = int(count)
+                logger.info(f"🇻🇳 Extracted Vietnamese total reactions: {result}")
+                return result
+            except (ValueError, TypeError):
+                logger.warning(f"🇻🇳 Failed to parse Vietnamese reaction number: {value_str}")
+        
+        # Fallback: Find all potential numbers, including those with K/M suffixes
+        matches = re.findall(r'(\d+[\.,]?\d*)([km]?)', text_lower)
         
         if not matches:
             return 0

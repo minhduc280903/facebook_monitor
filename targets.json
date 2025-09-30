@@ -1,14 +1,32 @@
 {
     "version": "1.0",
     "description": "Facebook monitoring targets configuration",
-    "last_updated": "2025-09-19T21:37:44.405444",
+    "last_updated": "2025-09-27T10:06:00.000000",
     "targets": [
+        {
+            "id": "fb_page_vnexpress",
+            "name": "VnExpress Page",
+            "url": "https://www.facebook.com/congdongvnexpress",
+            "type": "page",
+            "enabled": true,
+            "priority": "high",
+            "notes": "Public page - no join required"
+        },
+        {
+            "id": "fb_page_kenh14",
+            "name": "Kenh14 Page",
+            "url": "https://www.facebook.com/kenh14vn",
+            "type": "page",
+            "enabled": true,
+            "priority": "high",
+            "notes": "Public page - no join required"
+        },
         {
             "id": "fb_group_184730418261517",
             "name": "Facebook Group 184730418261517",
             "url": "https://www.facebook.com/groups/184730418261517",
             "type": "group",
-            "enabled": true,
+            "enabled": false,
             "priority": "high",
             "notes": "Primary monitoring target - enable when ready"
         },
@@ -31,13 +49,58 @@
             "notes": "Named group target - enable when ready"
         },
         {
-            "id": "nasa",
-            "name": "NASA",
-            "url": "https://www.facebook.com/NASA",
-            "type": "profile",
+            "id": "fb_group_463268410729602",
+            "name": "Facebook Group 463268410729602",
+            "url": "https://www.facebook.com/groups/463268410729602/",
+            "type": "group",
             "enabled": true,
-            "priority": "high",
-            "notes": ""
+            "priority": "medium",
+            "notes": "Added group target"
+        },
+        {
+            "id": "fb_group_164477160825069",
+            "name": "Facebook Group 164477160825069",
+            "url": "https://www.facebook.com/groups/164477160825069/",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Added group target"
+        },
+        {
+            "id": "fb_group_299915580482719",
+            "name": "Facebook Group 299915580482719",
+            "url": "https://www.facebook.com/groups/299915580482719/",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Added group target"
+        },
+        {
+            "id": "fb_group_323456425860395",
+            "name": "Facebook Group 323456425860395",
+            "url": "https://www.facebook.com/groups/323456425860395/",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Added group target"
+        },
+        {
+            "id": "fb_group_kosodoi",
+            "name": "Facebook Group Kosodoi",
+            "url": "https://www.facebook.com/groups/kosodoi/",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Named group target - kosodoi"
+        },
+        {
+            "id": "fb_group_952557292245255",
+            "name": "Facebook Group 952557292245255",
+            "url": "https://www.facebook.com/groups/952557292245255",
+            "type": "group",
+            "enabled": true,
+            "priority": "medium",
+            "notes": "Added group target"
         }
     ],
     "settings": {

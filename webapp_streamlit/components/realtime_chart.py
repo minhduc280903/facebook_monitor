@@ -30,7 +30,7 @@ class RealTimeChart:
     Component để hiển thị real-time charts với WebSocket updates
     """
     
-    def __init__(self, websocket_url: str = "ws://localhost:8000/ws"):
+    def __init__(self, websocket_url: str = "ws://facebook-monitor-api:8000/ws"):
         """
         Khởi tạo RealTimeChart
         

@@ -224,18 +224,9 @@ class DatabaseReader:
             if self.engine is not None:
                 return pd.read_sql_query(query, self.engine, params=params)
             else:
-                # Fallback to psycopg2 if SQLAlchemy failed
-                import psycopg2
-                db_config = self.db_manager.db_config
-                regular_conn = psycopg2.connect(
-                    host=db_config.host,
-                    port=db_config.port,
-                    user=db_config.user,
-                    password=db_config.password,
-                    dbname=db_config.name
-                )
-                df = pd.read_sql_query(query, regular_conn, params=params)
-                regular_conn.close()
+                # Fallback to DatabaseManager's thread-safe connection pool
+                with self.db_manager.get_connection() as conn:
+                    df = pd.read_sql_query(query, conn, params=params)
                 return df
         except Exception as e:
             logger.error(f"❌ Query execution failed: {e}")

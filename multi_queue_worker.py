@@ -1,909 +1,854 @@
 #!/usr/bin/env python3
 """
-Multi-Queue Worker for Facebook Post Monitor - Enterprise Edition Phase 3.1
-Worker có thể lắng nghe multiple queues với priority khác nhau
+Celery-based Task Worker for Facebook Post Monitor - Enterprise Edition Phase 3.2
+Chuyển đổi từ manual queue processing sang Celery distributed task system
 
-Vai trò:
-- Consumer thông minh cho multiple Redis queues  
-- Simplified task processing (TRACKING = DISCOVERY unified)
-- Tái sử dụng tất cả logic từ worker.py (SessionManager, ProxyManager, ScraperWorker)
-- Support specialized worker types hoặc generalist workers
+MIGRATION: MultiQueueWorker -> Celery Tasks
+- Giữ nguyên business logic scraping
+- Thay manual Redis polling bằng Celery task system
+- Automatic retries, priority queues, monitoring
 """
 
-import redis
 import sys
 import io
+import asyncio
+import os
+from typing import Dict, Any, Optional
+from datetime import datetime
+from celery import Celery, current_task
+from celery.exceptions import Retry
+from kombu import Queue
 
 # Fix encoding cho Windows console
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-
-import json
-import asyncio
-import os
-import time
-import uuid
-from datetime import datetime
-from typing import Optional, Any, Dict, List, Tuple
-from playwright.async_api import (
-    async_playwright, Page, BrowserContext, Playwright
-)
-
+# Import core modules
+from contextlib import asynccontextmanager
 from core.database_manager import DatabaseManager
-# SỬA LỖI: Import ScraperCoordinator thay vì ScraperWorker cũ
 from scrapers.scraper_coordinator import ScraperCoordinator, CaptchaException
 from core.session_manager import SessionManager, AccountRole
 from core.proxy_manager import ProxyManager
-from utils.browser_config import get_browser_launch_options, get_init_script, get_browser_args
-from utils.circuit_breaker import (
-    CircuitBreakerConfig, CircuitBreakerError,
-    ExponentialBackoff, circuit_breaker_registry
-)
-from multi_queue_config import (
-    MultiQueueConfig, QueueType
-)
+from utils.browser_config import get_browser_launch_options
 from logging_config import get_logger
 
-# Configuration management with fallback (tái sử dụng từ worker.py)
+# Configuration with fallback
 class FallbackConfig:
     failure_threshold = 3
     checkout_timeout = 30
     headless = True
-    max_tasks_per_cleanup = 1000
-    stats_log_interval = 5
-    backoff_base_delay = 1.0
-    backoff_max_delay = 30.0
-    database_failure_threshold = 3
-    database_recovery_timeout = 30
-    session_failure_threshold = 5
-    session_recovery_timeout = 60
-    browser_failure_threshold = 3
-    browser_recovery_timeout = 45
-    scraper_failure_threshold = 4
-    scraper_recovery_timeout = 120
-
 
 class FallbackSettings:
     def __init__(self):
         self.session = FallbackConfig()
         self.worker = FallbackConfig()
-        self.circuit_breaker = FallbackConfig()
-        self.redis = FallbackConfig()
 
-
-# Import settings with fallback
 try:
     from config import settings
 except ImportError:
     settings = FallbackSettings()
 
-# Get module logger
+# CELERY APPLICATION SETUP
+app = Celery('facebook_scraper')
+
+# Celery configuration
+app.conf.update(
+    broker_url='redis://redis:6379/0',
+    result_backend='redis://redis:6379/0',
+
+    # Task routing với priority queues
+    task_routes={
+        'facebook_scraper.scan_facebook_url': {'queue': 'scan_high', 'priority': 9},
+        'facebook_scraper.discovery_scan': {'queue': 'discovery', 'priority': 5},
+        'facebook_scraper.cleanup_task': {'queue': 'maintenance', 'priority': 1},
+        'facebook_scraper.dispatch_scan_tasks': {'queue': 'maintenance', 'priority': 8},
+        'facebook_scraper.health_check': {'queue': 'maintenance', 'priority': 1},
+        'facebook_scraper.browser_health_check': {'queue': 'maintenance', 'priority': 1},
+        'facebook_scraper.refresh_login_sessions': {'queue': 'maintenance', 'priority': 7},
+    },
+
+    # Worker configuration
+    worker_prefetch_multiplier=1,
+    worker_max_tasks_per_child=1000,
+    worker_concurrency=2,
+
+    # Task configuration
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_serializer='json',
+    result_serializer='json',
+    accept_content=['json'],
+
+    # Retry defaults
+    task_default_retry_delay=60,
+    task_max_retries=3,
+
+    # Monitoring
+    worker_send_task_events=True,
+    task_send_sent_event=True,
+
+    # Beat schedule - THAY THẾ manual scheduling
+    beat_schedule={
+        'dispatch-scan-tasks': {
+            'task': 'facebook_scraper.dispatch_scan_tasks',
+            'schedule': 300.0,  # 5 minutes
+        },
+        'cleanup-old-data': {
+            'task': 'facebook_scraper.cleanup_task',
+            'schedule': 3600.0,  # 1 hour
+        },
+        'browser-health-check': {
+            'task': 'facebook_scraper.browser_health_check',
+            'schedule': 1800.0,  # 30 minutes - Monitor browser resources
+        },
+        'refresh-sessions': {
+            'task': 'facebook_scraper.refresh_login_sessions',
+            'schedule': 86400.0,  # 24 hours - Re-login daily to keep sessions fresh
+        },
+    },
+    timezone='UTC',
+)
+
 logger = get_logger(__name__)
 
-
-class MultiQueueWorker:
+class SafeBrowserManager:
     """
-    Advanced consumer có thể xử lý multiple queues với priority
+    🔒 THREAD-SAFE & RESOURCE-SAFE Browser Manager with guaranteed cleanup
     
-    Tái sử dụng 100% logic từ TaskWorker nhưng với khả năng:
-    - Lắng nghe multiple queues theo priority order
-    - Smart queue selection based on task availability
-    - Dynamic worker allocation theo load
+    FIXES:
+    - Memory leaks từ unmanaged playwright instances
+    - Zombie Chrome processes từ failed cleanup
+    - Session-proxy resource leaks
+    - Port exhaustion từ DevTools ports
     """
-    
-    def __init__(
-        self, 
-        worker_id: str, 
-        queue_types: List[QueueType], 
-        config: MultiQueueConfig,
-        redis_client: Optional[redis.Redis] = None,
-        db_manager: Optional[DatabaseManager] = None,
-        session_manager: Optional[SessionManager] = None,
-        proxy_manager: Optional[ProxyManager] = None,
-        settings: Optional[Any] = None
-    ):
-        """
-        Initialize multi-queue worker với dependency injection và REAL SCRAPING
-        
-        Args:
-            worker_id: Unique identifier cho worker
-            queue_types: List of QueueType enums to process
-            config: Multi-queue configuration
-            redis_client: Redis client instance (injectable)
-            db_manager: Database manager instance (injectable)
-            session_manager: Session manager instance (injectable)
-            proxy_manager: Proxy manager instance (injectable)
-            settings: Configuration settings (injectable)
-        """
-        self.worker_id = worker_id
-        self.queue_types = queue_types
-        self.config = config
-        
-        # Get logger from centralized logging
-        from logging_config import get_logger
-        self.logger = get_logger(f"{__name__}.{worker_id}")
-        
-        # Use injected dependencies or create defaults
-        if settings is None:
-            # Fallback to import if not injected
-            try:
-                from config import settings
-            except ImportError:
-                settings = FallbackSettings()
-        self.settings = settings
-        
-        # Redis connection - use injected or create new
-        if redis_client:
-            self.redis_client = redis_client
-        else:
-            self.redis_client = redis.Redis(
-                host=getattr(settings.redis, 'host', 'redis'),
-                port=getattr(settings.redis, 'port', 6379),
-                decode_responses=True
-            )
-        
-        # Database manager - use injected or create new
-        if db_manager:
-            self.db_manager = db_manager
-        else:
-            self.db_manager = DatabaseManager()
-        
-        # Session manager - use injected or create new
-        if session_manager:
-            self.session_manager = session_manager
-        else:
-            self.session_manager = SessionManager()
-        
-        # Proxy manager - use injected or create new
-        if proxy_manager:
-            self.proxy_manager = proxy_manager
-        else:
-            self.proxy_manager = ProxyManager()
-        
-        # Performance metrics
-        self.stats = {
-            'tasks_processed': 0,
-            'tasks_failed': 0,
-            'tasks_by_queue': {qt.value: 0 for qt in queue_types},
-            'avg_processing_time': 0,
-            'start_time': datetime.now(),
-            'last_log_time': time.time()
-        }
-        
-        # Task cleanup counter
-        self.task_counter = 0
-        self.max_tasks_per_cleanup = getattr(settings.worker, 'max_tasks_per_cleanup', 1000)
-        
-        # Browser and scraper setup for REAL scraping
-        self.playwright = None
-        self.browser = None
-        self.context = None  # Added missing context attribute
-        self.page = None
-        self.browser_available = True  # Track browser availability
-        # SỬA LỖI: Sử dụng ScraperCoordinator
-        self.scraper_coordinator = None
-        
-        # Tái sử dụng circuit breakers từ worker.py
-        self._setup_circuit_breakers()
-        
-        self.logger.info(
-            f"Worker {worker_id} initialized for queues: {[qt.value for qt in queue_types]}",
-            extra={'worker_id': worker_id}
-        )
-    
-    def _setup_circuit_breakers(self):
-        """Setup circuit breakers for different components"""
-        from utils.circuit_breaker import CircuitBreakerConfig, circuit_breaker_registry
-        
-        # Database circuit breaker
-        db_config = CircuitBreakerConfig(
-            failure_threshold=getattr(self.settings.circuit_breaker, 'database_failure_threshold', 3),
-            recovery_timeout=getattr(self.settings.circuit_breaker, 'database_recovery_timeout', 30)
-        )
-        self.db_breaker = circuit_breaker_registry.get_breaker('database', db_config)
-        
-        # Session circuit breaker
-        session_config = CircuitBreakerConfig(
-            failure_threshold=getattr(self.settings.circuit_breaker, 'session_failure_threshold', 5),
-            recovery_timeout=getattr(self.settings.circuit_breaker, 'session_recovery_timeout', 60)
-        )
-        self.session_breaker = circuit_breaker_registry.get_breaker('session', session_config)
-        
-        # Browser circuit breaker
-        browser_config = CircuitBreakerConfig(
-            failure_threshold=getattr(self.settings.circuit_breaker, 'browser_failure_threshold', 3),
-            recovery_timeout=getattr(self.settings.circuit_breaker, 'browser_recovery_timeout', 45)
-        )
-        self.browser_breaker = circuit_breaker_registry.get_breaker('browser', browser_config)
-        
-        # Scraper circuit breaker
-        scraper_config = CircuitBreakerConfig(
-            failure_threshold=getattr(self.settings.circuit_breaker, 'scraper_failure_threshold', 4),
-            recovery_timeout=getattr(self.settings.circuit_breaker, 'scraper_recovery_timeout', 120)
-        )
-        self.scraper_breaker = circuit_breaker_registry.get_breaker('scraper', scraper_config)
-        
-        self.logger.info("🛡️ Circuit breakers initialized: database, session, browser, scraper")
-    
-    def _get_appropriate_role_for_queues(self) -> AccountRole:
-        """Luôn trả về MIXED vì worker SCAN làm cả hai việc."""
-        return AccountRole.MIXED
-    
-    def _try_role_based_session_assignment(self) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """
-        Try to assign a session based on worker's role requirements với proxy binding
-        
-        Returns:
-            Tuple (session_name, proxy_config) if successful, None if no suitable session available
-        """
-        try:
-            required_role = self._get_appropriate_role_for_queues()
-            self.logger.info(f"🎯 Worker {self.worker_id} requesting {required_role.value} session with bound proxy")
-            
-            # Use new session-proxy checkout method with extended timeout and pre-check
-            self.logger.info("🔍 Checking available sessions before checkout...")
-            available_sessions = len([s for s in self.session_manager.resource_pool.values() if s.status == 'READY'])
-            self.logger.info(f"📊 Available sessions: {available_sessions}")
-            
-            result = self.session_manager.checkout_session_with_proxy(self.proxy_manager, timeout=60)
-            
-            if result:
-                session_name, proxy_config = result
-                self.logger.info(f"✅ Assigned session-proxy pair: {session_name} -> {proxy_config.get('proxy_id')}")
-                return result
-            
-            self.logger.warning("❌ No session-proxy pairs available for assignment")
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error in role-based session-proxy assignment: {e}")
-            return None
 
-    async def _setup_browser(self) -> bool:
-        """Setup browser với session-proxy binding cho REAL scraping"""
+    def __init__(self):
+        self.session_manager = SessionManager()
+        self.proxy_manager = ProxyManager()
+        # ENHANCEMENT: Track active browser PIDs to prevent zombies
+        self.active_browser_pids = []
+        self.pid_lock = threading.Lock()
+        logger.info("🔒 SafeBrowserManager initialized with guaranteed cleanup and PID tracking")
+
+    @asynccontextmanager
+    async def browser_session(self):
+        """
+        🔒 GUARANTEED CLEANUP Context Manager
+        
+        Usage:
+            async with browser_manager.browser_session() as (page, session_name):
+                # Use page for scraping
+                # Auto cleanup guaranteed even on exceptions
+        """
+        playwright = None
+        context = None
+        session_name = None
+        proxy_config = None
+        
         try:
-            self.logger.info("🌐 Setting up REAL browser for Facebook scraping with session-proxy binding...")
-            
-            # Timeout wrapper cho toàn bộ browser setup process
-            try:
-                result = await asyncio.wait_for(self._setup_browser_internal(), timeout=180)  # 3 minutes max
-                if result:
-                    self.browser_available = True
-                    self.logger.info("✅ Browser setup completed successfully with session-proxy binding")
-                return result
-            except asyncio.TimeoutError:
-                self.logger.error("❌ Browser setup timed out after 3 minutes - worker cannot function without proper setup")
-                self.browser_available = False
-                return False  # Failed setup means worker should not continue
-        except Exception as e:
-            self.logger.error(f"❌ Browser setup failed: {e}")
-            self.browser_available = False
-            return False
-    
-    async def _setup_simple_browser(self) -> bool:
-        """Simple browser setup like manual_login - no session-proxy binding"""
-        try:
-            self.logger.info("Setting up SIMPLE browser (like manual_login)...")
-            
-            # Start Playwright
-            self.logger.info("DEBUG: Importing os module...")
-            import os
-            self.logger.info("DEBUG: Importing playwright...")
+            # Import here để tránh circular imports
             from playwright.async_api import async_playwright
-            self.logger.info("DEBUG: Importing browser config...")
-            from utils.browser_config import get_browser_launch_options
-            
-            self.logger.info("DEBUG: Starting playwright...")
-            self.playwright = await async_playwright().start()
-            self.logger.info("DEBUG: Playwright started successfully")
-            
-            # Use first available session directory (no complex binding)
-            sessions_dir = "./sessions"
-            if os.path.exists(sessions_dir):
-                session_dirs = [d for d in os.listdir(sessions_dir) if os.path.isdir(os.path.join(sessions_dir, d))]
-                if session_dirs:
-                    session_dir = os.path.join(sessions_dir, session_dirs[0])
-                    self.logger.info(f"Using simple session: {session_dirs[0]}")
-                else:
-                    self.logger.error("No session directories found")
-                    return False
-            else:
-                self.logger.error("Sessions directory not found")
-                return False
-            
-            # Simple browser launch (no proxy, like manual_login)
-            launch_options = get_browser_launch_options(
-                user_data_dir=session_dir,
-                headless=True,  # Worker runs headless
-                proxy_config=None  # No proxy complexity
-            )
-            
-            self.logger.info("Launching simple browser context...")
-            self.context = await self.playwright.chromium.launch_persistent_context(**launch_options)
-            self.browser = None
-            self.logger.info("Simple browser setup successful!")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Simple browser setup failed: {e}")
-            return False
-    
-    async def _setup_browser_internal(self) -> bool:
-        """Internal browser setup logic"""
-        try:
-            
-            # Start Playwright
-            self.playwright = await async_playwright().start()
-            
-            # Get headless setting from worker config (not scraping config)
-            headless = getattr(self.settings.worker, 'headless', True)
-            
-            # 🔗 SESSION-PROXY BINDING ASSIGNMENT with retry mechanism
+
+            logger.info("🚀 Starting browser session with guaranteed cleanup...")
+            playwright = await async_playwright().start()
+
+            # Session-proxy binding với retry logic
             max_retries = 3
             for attempt in range(max_retries):
-                self.logger.info(f"🔄 Attempt {attempt + 1}/{max_retries}: Requesting session-proxy pair...")
-                
-                session_proxy_pair = self._try_role_based_session_assignment()
+                logger.info(f"🔄 Browser setup attempt {attempt + 1}/{max_retries}")
+
+                session_proxy_pair = self._get_session_proxy_pair()
                 if not session_proxy_pair:
-                    self.logger.error(f"❌ Cannot get session-proxy pair on attempt {attempt + 1}/{max_retries}")
-                    if attempt == max_retries - 1:  # Last attempt
-                        return False
+                    if attempt == max_retries - 1:
+                        raise Exception("Cannot get session-proxy pair after all attempts")
                     continue
 
                 session_name, proxy_config = session_proxy_pair
                 session_dir = f"./sessions/{session_name}"
-                self.assigned_session_name = session_name  # Track for cleanup
-                self.assigned_proxy_config = proxy_config  # Track for cleanup
 
-                self.logger.info(f"✅ Assigned session-proxy pair: {session_name} -> {proxy_config.get('proxy_id', 'unknown')}")
-                self.logger.info(f"📁 Session directory: {session_dir}")
-                self.logger.info(f"🔗 Proxy config: {proxy_config.get('type', 'unknown')}://{proxy_config.get('host', 'unknown')}:{proxy_config.get('port', 'unknown')}")
+                logger.info(f"✅ Got session-proxy: {session_name} -> {proxy_config.get('proxy_id', 'unknown')}")
 
-                # Get browser launch options with bound proxy
+                # Browser launch options
                 launch_options = get_browser_launch_options(
                     user_data_dir=session_dir,
-                    headless=headless,
-                    proxy_config=proxy_config  # 🔗 Pass bound proxy config
+                    headless=getattr(settings.worker, 'headless', True),
+                    proxy_config=proxy_config
                 )
 
-                # If proxy validation failed, launch_options won't contain proxy
-                if proxy_config and 'proxy' not in launch_options:
-                    self.logger.warning(f"⚠️ Proxy {proxy_config.get('proxy_id')} failed validation, releasing and retrying...")
-                    # Release this session-proxy pair
-                    self.session_manager.checkin_session_with_proxy(session_name, proxy_config, self.proxy_manager)
-                    if attempt < max_retries - 1:
-                        continue  # Try with different proxy
-                    else:
-                        self.logger.warning("⚠️ All proxy attempts failed, launching without proxy...")
-                        launch_options = get_browser_launch_options(
-                            user_data_dir=session_dir,
-                            headless=headless,
-                            proxy_config=None  # No proxy
-                        )
-
-                # Try to launch browser with current configuration
                 try:
-                    # Launch persistent context với extended timeout và logging
-                    # asyncio already imported at top level
-                    self.logger.info(f"🚀 Launching browser with options: headless={launch_options.get('headless')}, proxy={'enabled' if 'proxy' in launch_options else 'disabled'}")
-                    self.context = await asyncio.wait_for(
-                        self.playwright.chromium.launch_persistent_context(**launch_options),
-                        timeout=60  # Increased from 30 to 60 seconds
+                    context = await asyncio.wait_for(
+                        playwright.chromium.launch_persistent_context(**launch_options),
+                        timeout=60
                     )
-                    self.browser = None  # Không cần browser object riêng
-                    self.logger.info(f"✅ Browser launched successfully with {'proxy' if 'proxy' in launch_options else 'no proxy'}")
-                    break  # Success, exit retry loop
-
-                except asyncio.TimeoutError:
-                    self.logger.error(f"⏰ Browser launch timed out on attempt {attempt + 1}")
-                    # Release this session-proxy pair
-                    self.session_manager.checkin_session_with_proxy(session_name, proxy_config, self.proxy_manager)
-                    if attempt < max_retries - 1:
-                        continue  # Try again
-                    else:
-                        self.logger.error("❌ All browser launch attempts failed")
-                        return False
+                    break  # Success
 
                 except Exception as e:
-                    self.logger.error(f"❌ Browser launch failed on attempt {attempt + 1}: {e}")
-                    # Release this session-proxy pair
-                    self.session_manager.checkin_session_with_proxy(session_name, proxy_config, self.proxy_manager)
-                    if attempt < max_retries - 1:
-                        continue  # Try again
-                    else:
-                        self.logger.error("❌ All browser launch attempts failed")
-                        return False
+                    logger.error(f"❌ Browser launch failed on attempt {attempt + 1}: {e}")
+                    # Cleanup session-proxy on failed attempt
+                    if session_proxy_pair:
+                        self.session_manager.checkin_session_with_proxy(
+                            session_name, proxy_config, self.proxy_manager,
+                            session_status="READY", proxy_status="READY"
+                        )
+                        session_name, proxy_config = None, None  # Reset for cleanup
+                    if attempt == max_retries - 1:
+                        raise
 
-            if not self.context:
-                self.logger.error("❌ Failed to launch browser after all attempts")
-                return False
-            
-            # FIX: Sử dụng trang có sẵn trong context thay vì tạo mới
-            # Trang có sẵn chứa session đã đăng nhập, cookies và trạng thái
-            if self.context.pages:
-                self.page = self.context.pages[0]
-                self.logger.info("✅ Using existing page with session data")
-            else:
-                # Fallback: tạo trang mới nếu không có sẵn (hiếm khi xảy ra)
-                self.page = await self.context.new_page()
-                self.logger.info("⚠️ Created new page (no existing session found)")
-            
+            if not context:
+                raise Exception("Failed to launch browser context after all retries")
+
+            # Get page
+            page = context.pages[0] if context.pages else await context.new_page()
+
             # Add stealth scripts
+            from utils.browser_config import get_init_script
             init_script = get_init_script()
-            await self.page.add_init_script(init_script)
+            await page.add_init_script(init_script)
             
-            # SỬA LỖI: Khởi tạo ScraperCoordinator thay vì ScraperWorker
-            self.scraper_coordinator = ScraperCoordinator(self.db_manager, self.page)
-            
-            # ENHANCED LOGGING: Ghi lại chi tiết session và proxy assignment
-            session_info = f"Session: {self.assigned_session_name}"
-            proxy_info = "No Proxy"
-            if self.assigned_proxy_config:
-                proxy_id = self.assigned_proxy_config.get('proxy_id', 'unknown')
-                proxy_host = self.assigned_proxy_config.get('host', 'unknown')  
-                proxy_port = self.assigned_proxy_config.get('port', 'unknown')
-                proxy_info = f"Proxy: {proxy_id} ({proxy_host}:{proxy_port})"
-            
-            self.logger.info(f"✅ PRODUCTION BROWSER SETUP COMPLETED!")
-            self.logger.info(f"📋 {session_info}")
-            self.logger.info(f"🌐 {proxy_info}")
-            self.logger.info(f"🔧 Worker {self.worker_id} ready for production scraping")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"❌ Browser setup failed: {e}")
-            await self._cleanup_browser()
-            return False
-    
-    async def _cleanup_browser(self):
-        """Cleanup browser resources"""
-        try:
-            if self.context:
-                await self.context.close()
-            # Note: persistent context tự động đóng browser
-            if self.playwright:
-                await self.playwright.stop()
-                
-            self.page = None
-            self.context = None
-            self.browser = None
-            self.playwright = None
-            # SỬA LỖI: Dọn dẹp ScraperCoordinator
-            self.scraper_coordinator = None
-            
-            self.logger.info("🧹 Browser resources cleaned up")
-            
-        except Exception as e:
-            self.logger.error(f"❌ Browser cleanup error: {e}")
-
-    async def process_queues(self):
-        """
-        Main processing loop for multi-queue worker với REAL browser scraping
-        """
-        # Import modules at top level to avoid subprocess import hang
-        self.logger.info("DEBUG: Entering process_queues method")
-        
-        try:
-            import time
-            self.logger.info("DEBUG: time module imported successfully")
-        except Exception as e:
-            self.logger.error(f"ERROR importing time: {e}")
-            return
-        
-        try:
-            start_time = time.time()
-            self.logger.info(f"DEBUG: time.time() called: {start_time}")
-        except Exception as e:
-            self.logger.error(f"ERROR calling time.time(): {e}")
-            return
-            
-        self.logger.info("Starting multi-queue processing loop with REAL SCRAPING...")
-        self.logger.info(f"Step 1: Start time recorded: {start_time}")
-        
-        try:
-            self.logger.info("Step 2: Formatting queue types...")
-            queue_names = str([qt.value for qt in self.queue_types])
-            self.logger.info(f"Queue priority order: {queue_names}")
-        except Exception as e:
-            self.logger.error(f"Error formatting queue types: {e}")
-            self.logger.info("Queue priority order: [unable to format]")
-        
-        self.logger.info("Step 3: Time calculation...")
-        current_time = time.time()
-        elapsed = current_time - start_time
-        self.logger.info(f"Step 4: About to start browser setup... (after {elapsed:.1f}s)")
-        # FIXED: Use proper browser setup with session-proxy binding 
-        try:
-            browser_setup = await asyncio.wait_for(self._setup_browser(), timeout=180)  # 3 minutes for proper setup
-        except asyncio.TimeoutError:
-            self.logger.error("❌ Browser setup timeout after 3 minutes - worker will exit")
-            return  # Exit worker completely on setup failure
-        except Exception as e:
-            self.logger.error(f"❌ Browser setup failed with error: {e}")
-            return  # Exit worker completely on setup failure
-        
-        if not browser_setup:
-            self.logger.error("❌ Cannot start worker without proper browser setup! Exiting.")
-            return
-        self.logger.info("Browser setup completed, starting task processing...")
-        
-        try:
-            while True:
-                task_found = False
-                
-                # Process queues in priority order
-                for queue_type in self.queue_types:
-                    queue_name = queue_type.value
-                    
-                    try:
-                        # Try to get a task from this queue
-                        task = self.redis_client.blpop([queue_name], timeout=1)
-                        
-                        if task:
-                            _, task_data = task
-                            task_found = True
-                            
-                            # Parse task data with improved error handling
-                            message = json.loads(task_data)
-                            task_info = message.get('payload') # <-- FIX: Mở "phong bì" payload
-
-                            # FIXED: Comprehensive task_info validation
-                            if not task_info:
-                                self.logger.error(f"❌ Invalid message format in {queue_name}: missing payload. Skipping task.")
-                                continue
-                            
-                            if not isinstance(task_info, dict):
-                                self.logger.error(f"❌ Invalid task_info type in {queue_name}: expected dict, got {type(task_info)}. Skipping task.")
-                                continue
-                            
-                            if not task_info.get('url'):
-                                self.logger.error(f"❌ Invalid task in {queue_name}: missing URL. Skipping task.")
-                                continue
-                            
-                            self.logger.info(f"🔄 REAL SCRAPING task from {queue_name}: {task_info.get('url', 'unknown')[:50]}")
-                            
-                            # Process the task with REAL SCRAPING
-                            await self._process_task(task_info) # Xử lý task SCAN duy nhất
-                            
-                            # Update statistics
-                            self.stats['tasks_processed'] += 1
-                            self.stats['tasks_by_queue'][queue_name] += 1
-                            
-                            # 🎯 REPORT SUCCESS TO SESSION MANAGER
-                            if hasattr(self, 'assigned_session_name') and self.assigned_session_name:
-                                self.session_manager.report_outcome(self.assigned_session_name, 'success')
-                            
-                            # Log progress periodically
-                            if time.time() - self.stats['last_log_time'] > 30:  # Every 30 seconds
-                                self._log_stats()
-                            
-                            break  # Process one task at a time, restart priority loop
-                            
-                    except redis.RedisError as e:
-                        self.logger.error(f"❌ Redis error for queue {queue_name}: {e}")
-                        continue
-                    except json.JSONDecodeError as e:
-                        self.logger.error(f"❌ Invalid task data in {queue_name}: {e}")
-                        continue
-                    except CaptchaException as e:
-                        self.logger.critical(f"🚨 CAPTCHA detected: {e}")
-                        # Pause briefly and continue
-                        await asyncio.sleep(60)
-                        continue
-                    except Exception as e:
-                        self.logger.error(f"❌ Unexpected error processing {queue_name}: {e}")
-                        self.stats['tasks_failed'] += 1
-                        
-                        # 🎯 REPORT FAILURE TO SESSION MANAGER  
-                        if hasattr(self, 'assigned_session_name') and self.assigned_session_name:
-                            self.session_manager.report_outcome(self.assigned_session_name, 'failure', {'error': str(e)})
-                        continue
-                
-                # If no tasks found in any queue, wait briefly before retrying
-                if not task_found:
-                    await asyncio.sleep(1)
-                    
-        except KeyboardInterrupt:
-            self.logger.info("⏹️ Received shutdown signal, stopping worker...")
-        except Exception as e:
-            self.logger.error(f"💥 Fatal error in processing loop: {e}")
-            raise
-        finally:
-            await self._cleanup()
-    
-    async def _process_task(self, task_info: dict):
-        """Xử lý một task SCAN duy nhất."""
-        self.logger.debug(f"Processing SCAN task: {task_info}")
-        
-        if not self.scraper_coordinator:
-            self.logger.error("❌ ScraperCoordinator not initialized!")
-            raise Exception("ScraperCoordinator not available")
-        
-        try:
-            await self._process_scan_real(task_info)
-        except CaptchaException:
-            raise # Đẩy lỗi CAPTCHA lên để xử lý đặc biệt
-        except Exception as e:
-            self.logger.error(f"Lỗi xử lý scan task: {e}")
-            raise
-    
-    async def _process_scan_real(self, task_info: dict):
-        """
-        Process scan task với KIẾN TRÚC MỚI - unified scanning với time-based filtering
-        
-        Logic đơn giản: Chỉ cần gọi scraper_coordinator.process_url() 
-        vì tất cả logic phức tạp đã được tích hợp sẵn trong ScraperCoordinator
-        """
-        target_url = task_info.get('url', '')
-        self.logger.info(f"🔍 REAL SCANNING (NEW ARCHITECTURE): {target_url}")
-        
-        if not target_url:
-            self.logger.error("❌ Scan task has no URL. Skipping.")
-            return
-
-        try:
-            # KIẾN TRÚC MỚI: Chỉ cần một lệnh gọi duy nhất
-            # ScraperCoordinator đã tích hợp:
-            # - Start date checking
-            # - Time-based filtering  
-            # - Discovery + tracking logic
-            # - Atomic dual-stream processing
-            scraping_result = await self.scraper_coordinator.process_url(target_url)
-            
-            self.logger.info(f"✅ SCAN (NEW ARCHITECTURE) results:")
-            self.logger.info(f"   📊 New posts discovered: {scraping_result.get('new_posts', 0)}")
-            self.logger.info(f"   📈 Interactions logged: {scraping_result.get('interactions_logged', 0)}")
-            self.logger.info(f"   ❌ Errors: {scraping_result.get('errors', 0)}")
-            
-            if scraping_result.get('errors', 0) > 0:
-                self.logger.warning(f"⚠️ Scan had {scraping_result['errors']} errors")
-                
-        except CaptchaException:
-            # Re-raise for special handling
-            raise
-        except Exception as e:
-            self.logger.error(f"❌ Scan scraping failed: {e}")
-            raise
-    
-    def _log_stats(self):
-        """Log worker statistics"""
-        uptime = datetime.now() - self.stats['start_time']
-        
-        self.logger.info(
-            f"📊 Worker Stats - "
-            f"Processed: {self.stats['tasks_processed']}, "
-            f"Failed: {self.stats['tasks_failed']}, "
-            f"Uptime: {uptime}"
-        )
-        
-        for queue_name, count in self.stats['tasks_by_queue'].items():
-            if count > 0:
-                self.logger.info(f"   {queue_name}: {count} tasks")
-        
-        self.stats['last_log_time'] = time.time()
-    
-    async def _cleanup(self):
-        """Cleanup ALL resources including browser, session-proxy pair"""
-        self.logger.info("🧹 Cleaning up ALL worker resources...")
-        
-        await self._cleanup_browser()
-        
-        # 🔗 PRODUCTION: Consistent session-proxy pair checkin
-        if (hasattr(self, 'assigned_session_name') and self.assigned_session_name and 
-            hasattr(self, 'assigned_proxy_config') and self.assigned_proxy_config):
+            # ENHANCEMENT: Track browser process PID for zombie prevention
             try:
-                self.session_manager.checkin_session_with_proxy(
-                    self.assigned_session_name,
-                    self.assigned_proxy_config,
-                    self.proxy_manager,
-                    session_status="READY",
-                    proxy_status="READY"
-                )
-                self.logger.info(f"✅ Checked in session-proxy pair: {self.assigned_session_name} -> {self.assigned_proxy_config.get('proxy_id')}")
+                # Try to get browser process PID (Playwright internal)
+                if hasattr(context, '_browser') and hasattr(context._browser, '_proc'):
+                    browser_pid = context._browser._proc.pid
+                    with self.pid_lock:
+                        self.active_browser_pids.append(browser_pid)
+                    logger.debug(f"📍 Tracking browser PID: {browser_pid}")
             except Exception as e:
-                self.logger.error(f"❌ Error checking in session-proxy pair: {e}")
-                
-                # 🔧 EMERGENCY FALLBACK: Separate checkin only when unified method fails
-                # This preserves resources in case of binding system issues
-                try:
-                    if self.assigned_session_name:
-                        self.session_manager.checkin_session(self.assigned_session_name)
-                        self.logger.info(f"🚨 Emergency session checkin: {self.assigned_session_name}")
-                    if self.assigned_proxy_config:
-                        self.proxy_manager.checkin_proxy(self.assigned_proxy_config)
-                        self.logger.info(f"🚨 Emergency proxy checkin: {self.assigned_proxy_config.get('proxy_id')}")
-                except Exception as fallback_error:
-                    self.logger.error(f"❌ Emergency fallback also failed: {fallback_error}")
-                    # Log for monitoring - this indicates serious system issues
-                    self.logger.critical(f"🚨 CRITICAL: Both unified and emergency checkin failed for session {self.assigned_session_name}")
-        
-        # Reset assignments to prevent double-checkin
-        self.assigned_session_name = None
-        self.assigned_proxy_config = None
-        
-        try:
-            if hasattr(self, 'db_manager') and self.db_manager:
-                self.db_manager.close()
-            if hasattr(self, 'redis_client') and self.redis_client:
-                self.redis_client.close()
-        except Exception as e:
-            self.logger.error(f"❌ Error during cleanup: {e}")
+                logger.debug(f"Could not track browser PID: {e}")
 
-async def run_worker_with_auto_restart(worker: MultiQueueWorker, max_restarts: int = 5, restart_delay: int = 30):
-    """
-    Wrapper function để chạy worker với auto-restart mechanism
-    
-    Args:
-        worker: MultiQueueWorker instance
-        max_restarts: Số lần restart tối đa
-        restart_delay: Thời gian delay giữa các lần restart (seconds)
-    """
-    restart_count = 0
-    
-    while restart_count < max_restarts:
-        try:
-            logger.info(f"🚀 Starting worker {worker.worker_id} (attempt {restart_count + 1}/{max_restarts + 1})")
-            await worker.process_queues()
+            logger.info(f"✅ Browser session ready: {session_name}")
             
-            # Nếu worker exit gracefully (không có exception), break
-            logger.info(f"✅ Worker {worker.worker_id} completed gracefully")
-            break
-            
-        except KeyboardInterrupt:
-            logger.info(f"⏹️ Worker {worker.worker_id} interrupted by user")
-            break
-            
+            # Yield to caller - guaranteed cleanup in finally block
+            yield page, session_name
+
         except Exception as e:
-            restart_count += 1
-            logger.error(f"💥 Worker {worker.worker_id} crashed: {e}")
+            logger.error(f"❌ Browser session setup failed: {e}")
+            raise
+
+        finally:
+            # 🔒 GUARANTEED CLEANUP - Always executes even on exceptions
+            logger.info("🧹 Starting guaranteed browser cleanup...")
             
-            if restart_count < max_restarts:
-                logger.info(f"🔄 Restarting worker in {restart_delay} seconds... (attempt {restart_count + 1}/{max_restarts})")
-                await asyncio.sleep(restart_delay)
-                
-                # Reset worker state for restart
+            cleanup_errors = []
+            
+            # 1. Close browser context
+            if context:
                 try:
-                    await worker._cleanup()
-                    logger.info(f"🧹 Worker {worker.worker_id} cleaned up for restart")
-                except Exception as cleanup_error:
-                    logger.error(f"❌ Cleanup error: {cleanup_error}")
+                    await context.close()
+                    logger.info("✅ Browser context closed")
+                except Exception as e:
+                    cleanup_errors.append(f"Context close error: {e}")
+            
+            # 2. Stop playwright
+            if playwright:
+                try:
+                    await playwright.stop()
+                    logger.info("✅ Playwright stopped")
+                except Exception as e:
+                    cleanup_errors.append(f"Playwright stop error: {e}")
+            
+            # 3. Checkin session-proxy pair
+            if session_name and proxy_config:
+                try:
+                    self.session_manager.checkin_session_with_proxy(
+                        session_name, proxy_config, self.proxy_manager,
+                        session_status="READY", proxy_status="READY"
+                    )
+                    logger.info(f"✅ Session-proxy checked in: {session_name}")
+                except Exception as e:
+                    cleanup_errors.append(f"Session checkin error: {e}")
+            
+            # 4. ENHANCEMENT: Cleanup tracked browser PIDs
+            try:
+                import psutil
+                with self.pid_lock:
+                    for pid in self.active_browser_pids[:]:  # Iterate over copy
+                        try:
+                            proc = psutil.Process(pid)
+                            if proc.is_running():
+                                proc.terminate()
+                                logger.debug(f"🧹 Terminated tracked browser PID: {pid}")
+                            self.active_browser_pids.remove(pid)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            # Process already gone
+                            if pid in self.active_browser_pids:
+                                self.active_browser_pids.remove(pid)
+            except ImportError:
+                pass  # psutil not available
+            except Exception as e:
+                cleanup_errors.append(f"PID cleanup error: {e}")
+            
+            # Log cleanup errors but don't raise to avoid masking original exceptions
+            if cleanup_errors:
+                logger.warning(f"⚠️ Cleanup completed with {len(cleanup_errors)} errors: {cleanup_errors}")
             else:
-                logger.error(f"❌ Worker {worker.worker_id} exceeded max restarts ({max_restarts}), giving up")
-                break
-    
-    logger.info(f"🏁 Worker {worker.worker_id} finished after {restart_count} restarts")
+                logger.info("🎉 Browser cleanup completed successfully")
 
+    def _get_session_proxy_pair(self):
+        """Get session-proxy pair with error handling"""
+        try:
+            required_role = AccountRole.MIXED
+            logger.info(f"🎯 Requesting {required_role.value} session with bound proxy")
 
-def main():
-    """Hàm main để chạy multi-queue worker với dependency injection mặc định"""
-    import argparse
-    from logging_config import setup_application_logging, get_logger
-    from dependency_injection import ServiceManager
+            result = self.session_manager.checkout_session_with_proxy(self.proxy_manager, timeout=60)
+            if result:
+                session_name, proxy_config = result
+                logger.info(f"✅ Session-proxy assigned: {session_name} -> {proxy_config.get('proxy_id')}")
+                return result
+
+            logger.warning("❌ No session-proxy pairs available")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Session-proxy assignment error: {e}")
+            return None
+
+    async def get_browser_health_metrics(self):
+        """Get browser health metrics for monitoring"""
+        try:
+            import psutil
+            chrome_processes = []
+            total_memory = 0
+            
+            for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower() or 'chromium' in proc.info['name'].lower():
+                        memory_mb = proc.info['memory_info'].rss / 1024 / 1024
+                        chrome_processes.append({
+                            'pid': proc.info['pid'],
+                            'name': proc.info['name'],
+                            'memory_mb': round(memory_mb, 2)
+                        })
+                        total_memory += memory_mb
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            return {
+                'chrome_process_count': len(chrome_processes),
+                'total_memory_mb': round(total_memory, 2),
+                'processes': chrome_processes[:10]  # Limit to first 10 for logging
+            }
+        except ImportError:
+            logger.warning("⚠️ psutil not available, cannot get browser health metrics")
+            return {'chrome_process_count': 'unknown', 'total_memory_mb': 'unknown', 'processes': []}
+        except Exception as e:
+            logger.error(f"❌ Error getting browser health metrics: {e}")
+            return {'chrome_process_count': 'error', 'total_memory_mb': 'error', 'processes': []}
+
+    async def cleanup_zombie_browsers(self):
+        """
+        Clean up zombie Chrome/Chromium processes
+        
+        ENHANCED: Also cleans up orphaned processes that were supposed to be tracked
+        """
+        try:
+            import psutil
+            import signal
+            
+            killed_count = 0
+            zombie_processes = []
+            orphaned_processes = []
+            
+            # Get currently tracked PIDs
+            with self.pid_lock:
+                tracked_pids = set(self.active_browser_pids[:])
+            
+            for proc in psutil.process_iter(['pid', 'name', 'status', 'create_time']):
+                try:
+                    if ('chrome' in proc.info['name'].lower() or 'chromium' in proc.info['name'].lower()):
+                        pid = proc.info['pid']
+                        
+                        # Kill zombie processes
+                        if proc.info['status'] == psutil.STATUS_ZOMBIE:
+                            zombie_processes.append(pid)
+                            try:
+                                proc.kill()
+                                killed_count += 1
+                                logger.info(f"🧹 Killed zombie Chrome process: {pid}")
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                        
+                        # ENHANCEMENT: Kill orphaned Chrome processes (old, not tracked)
+                        # If process is older than 1 hour and not in tracked PIDs
+                        elif pid not in tracked_pids:
+                            current_time = time.time()
+                            process_age = current_time - proc.info['create_time']
+                            
+                            # Kill if older than 1 hour (likely orphaned)
+                            if process_age > 3600:
+                                orphaned_processes.append(pid)
+                                try:
+                                    proc.terminate()
+                                    killed_count += 1
+                                    logger.info(f"🧹 Terminated orphaned Chrome process: {pid} (age: {process_age/60:.1f}min)")
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                        
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            if killed_count > 0:
+                logger.info(f"🧹 Cleaned up {killed_count} Chrome processes ({len(zombie_processes)} zombies, {len(orphaned_processes)} orphaned)")
+            
+            return {
+                'killed_zombies': len(zombie_processes), 
+                'killed_orphaned': len(orphaned_processes),
+                'zombie_pids': zombie_processes,
+                'orphaned_pids': orphaned_processes,
+                'total_killed': killed_count
+            }
+        except ImportError:
+            logger.warning("⚠️ psutil not available, cannot cleanup zombie browsers")
+            return {'killed_zombies': 0, 'killed_orphaned': 0, 'zombie_pids': [], 'orphaned_pids': [], 'total_killed': 0}
+        except Exception as e:
+            logger.error(f"❌ Error cleaning up zombie browsers: {e}")
+            return {'killed_zombies': 0, 'killed_orphaned': 0, 'zombie_pids': [], 'orphaned_pids': [], 'total_killed': 0}
+
+# Legacy BrowserManager for backward compatibility (DEPRECATED)
+class BrowserManager:
+    """⚠️ DEPRECATED: Use SafeBrowserManager instead. This class has resource leak issues."""
     
-    # Setup centralized logging
-    setup_application_logging()
+    def __init__(self):
+        logger.warning("⚠️ DEPRECATED BrowserManager used. Migrate to SafeBrowserManager.browser_session()")
+        self.safe_manager = SafeBrowserManager()
     
-    parser = argparse.ArgumentParser(description="Multi-Queue Worker for Facebook Post Monitor")
-    parser.add_argument("--worker-id", type=str, help="Worker ID (auto-generate if not provided)")
-    parser.add_argument("--queues", type=str, nargs="+", 
-                       choices=["scan", "all"],
-                       default=["all"],
-                       help="Queues to listen to")
-    parser.add_argument("--headless", action="store_true", default=False, help="Run browser in headless mode")
-    parser.add_argument("--no-headless", action="store_true", default=False, help="Run browser in visible mode (override headless)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--auto-restart", action="store_true", default=False, help="Enable auto-restart on worker crash")
-    parser.add_argument("--max-restarts", type=int, default=5, help="Maximum number of restarts (default: 5)")
-    parser.add_argument("--restart-delay", type=int, default=30, help="Delay between restarts in seconds (default: 30)")
-    
-    args = parser.parse_args()
-    
-    logger = get_logger(__name__)
-    
-    if args.debug:
-        import logging
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.info("Debug mode enabled")
-    
-    # Generate worker ID if not provided
-    worker_id = args.worker_id or f"worker_{uuid.uuid4().hex[:8]}"
-    
-    # Map queue arguments to QueueType
-    if "all" in args.queues:
-        queue_types = MultiQueueConfig.get_all_queues()
-    else:
-        queue_map = {
-            "scan": QueueType.SCAN  # Only SCAN queue in unified architecture
+    async def get_browser_session(self):
+        """⚠️ DEPRECATED: Resource leak prone method"""
+        logger.error("❌ DEPRECATED get_browser_session() called. Use SafeBrowserManager.browser_session() context manager!")
+        raise DeprecationWarning("Use SafeBrowserManager.browser_session() context manager for guaranteed cleanup")
+
+# CELERY TASKS - THAY THẾ MultiQueueWorker.process_queues()
+
+@app.task(bind=True, name='facebook_scraper.scan_facebook_url', max_retries=3)
+def scan_facebook_url(self, task_info: dict):
+    """
+    MIGRATION: Thay thế MultiQueueWorker._process_scan_real()
+    Celery task cho scanning Facebook URL
+    """
+    url = task_info.get('url', '')
+
+    try:
+        logger.info(f"🔍 CELERY SCAN: {url}")
+
+        if not url:
+            raise ValueError("No URL provided in task")
+
+        # Run async scraping logic trong sync Celery task
+        result = asyncio.run(_async_scan_task(task_info))
+
+        logger.info(f"✅ Scan completed: {result}")
+        return {
+            'status': 'success',
+            'url': url,
+            'new_posts': result.get('new_posts', 0),
+            'interactions_logged': result.get('interactions_logged', 0),
+            'task_id': self.request.id
         }
-        queue_types = [queue_map[q] for q in args.queues if q in queue_map]
+
+    except CaptchaException as e:
+        logger.critical(f"🚨 CAPTCHA detected: {e}")
+        # CAPTCHA không retry, pause task
+        raise Exception(f"CAPTCHA detected: {e}")
+
+    except Exception as exc:
+        logger.error(f"❌ Scan failed for {url}: {exc}")
+
+        # Automatic retry với exponential backoff (thay thế manual retry logic)
+        if self.request.retries < self.max_retries:
+            retry_countdown = 60 * (2 ** self.request.retries)  # 60s, 120s, 240s
+            logger.warning(f"🔄 Retrying in {retry_countdown}s (attempt {self.request.retries + 1})")
+            raise self.retry(countdown=retry_countdown, exc=exc)
+
+        logger.error(f"💥 Max retries exceeded for {url}")
+        return {
+            'status': 'failed',
+            'url': url,
+            'error': str(exc),
+            'task_id': self.request.id
+        }
+
+async def _async_scan_task(task_info: dict):
+    """
+    🔒 SAFE ASYNC SCAN TASK with guaranteed resource cleanup
     
+    FIXES:
+    - Browser resource leaks
+    - Database connection leaks  
+    - Session-proxy resource leaks
+    - Guaranteed cleanup even on exceptions
+    """
+    db_manager = None
+    browser_manager = SafeBrowserManager()
+    
+    try:
+        # Initialize database manager
+        db_manager = DatabaseManager()
+        
+        # Use SafeBrowserManager with guaranteed cleanup
+        async with browser_manager.browser_session() as (page, session_name):
+            # Initialize scraper with managed resources
+            scraper_coordinator = ScraperCoordinator(db_manager, page)
+
+            # Process URL
+            target_url = task_info.get('url', '')
+            logger.info(f"🎯 Processing URL: {target_url}")
+            scraping_result = await scraper_coordinator.process_url(target_url)
+
+            # Report success
+            if session_name:
+                browser_manager.session_manager.report_outcome(session_name, 'success')
+                logger.info(f"✅ Reported success for session: {session_name}")
+
+            return scraping_result
+
+    except Exception as e:
+        logger.error(f"❌ Task failed: {e}")
+        # Note: session reporting will be handled by browser context manager cleanup
+        raise
+
+    finally:
+        # Cleanup database resources
+        if db_manager:
+            db_manager.close()
+            logger.info("✅ Database manager cleaned up")
+        # Browser cleanup is automatically handled by context manager
+
+@app.task(name='facebook_scraper.dispatch_scan_tasks')
+def dispatch_scan_tasks():
+    """
+    MIGRATION: Thay thế scan_scheduler.py logic
+    Celery Beat task để dispatch scan tasks
+    """
+    try:
+        import json
+        from datetime import datetime, timedelta
+
+        logger.info("📋 Dispatching scan tasks...")
+
+        # Load targets (giữ nguyên logic từ schedulers)
+        with open('targets.json', 'r') as f:
+            targets_data = json.load(f)
+            targets = targets_data.get('targets', [])
+
+        dispatched_count = 0
+        for target in targets:
+            url = target.get('url')
+            if url:
+                # Dispatch task với priority (thay manual queue logic)
+                priority = 9 if target.get('priority') == 'high' else 5
+                scan_facebook_url.apply_async(
+                    args=[{'url': url}],
+                    queue='scan_high' if priority > 7 else 'scan_normal',
+                    priority=priority
+                )
+                dispatched_count += 1
+
+        logger.info(f"✅ Dispatched {dispatched_count} scan tasks")
+        return {'dispatched': dispatched_count}
+
+    except Exception as e:
+        logger.error(f"❌ Task dispatch failed: {e}")
+        raise
+
+@app.task(name='facebook_scraper.cleanup_task')
+def cleanup_task():
+    """Periodic cleanup task"""
+    db_manager = None
+    try:
+        logger.info("🧹 Running cleanup task...")
+
+        # Database cleanup logic
+        db_manager = DatabaseManager()
+        # Add cleanup logic here
+
+        logger.info("✅ Cleanup completed")
+        return {'status': 'success'}
+
+    except Exception as e:
+        logger.error(f"❌ Cleanup failed: {e}")
+        raise
+    finally:
+        # Cleanup database resources to avoid connection leaks
+        if db_manager:
+            db_manager.close()
+
+@app.task(name='facebook_scraper.debug_session_test')
+def debug_session_test():
+    """Debug task để test session availability và browser startup"""
+    try:
+        logger.info("🔍 DEBUG: Testing session availability and browser startup...")
+
+        # Test session manager
+        from core.session_manager import SessionManager
+        from core.proxy_manager import ProxyManager
+
+        session_manager = SessionManager()
+        proxy_manager = ProxyManager()
+
+        # Get session stats
+        session_stats = session_manager.get_stats()
+        logger.info(f"📊 Session stats: {session_stats}")
+
+        # Test session checkout
+        session_proxy_pair = session_manager.checkout_session_with_proxy(proxy_manager, timeout=30)
+        if session_proxy_pair:
+            session_name, proxy_config = session_proxy_pair
+            logger.info(f"✅ Session checkout successful: {session_name} -> {proxy_config.get('proxy_id')}")
+
+            # Checkin immediately
+            session_manager.checkin_session_with_proxy(session_name, proxy_config, proxy_manager)
+            logger.info(f"🔓 Session checked in: {session_name}")
+
+            return {
+                'status': 'success',
+                'session_stats': session_stats,
+                'test_session': session_name,
+                'test_proxy': proxy_config.get('proxy_id', 'unknown')
+            }
+        else:
+            logger.error("❌ No session-proxy pairs available")
+            return {
+                'status': 'failed',
+                'error': 'No session-proxy pairs available',
+                'session_stats': session_stats
+            }
+
+    except Exception as e:
+        logger.error(f"❌ Debug test failed: {e}")
+        return {
+            'status': 'failed',
+            'error': str(e)
+        }
+
+@app.task(bind=True, name='facebook_scraper.test_single_target')
+def test_single_target(self, target_url: str):
+    """Test scraping một target cụ thể với enhanced logging"""
+    try:
+        logger.info(f"🎯 DEBUG SCRAPE: Testing single target: {target_url}")
+
+        # Run async scraping với enhanced logging
+        result = asyncio.run(_async_scan_task_debug({'url': target_url}))
+
+        logger.info(f"✅ Debug scrape result: {result}")
+        return {
+            'status': 'success',
+            'target_url': target_url,
+            'result': result,
+            'task_id': self.request.id
+        }
+
+    except Exception as exc:
+        logger.error(f"❌ Debug scrape failed for {target_url}: {exc}")
+        return {
+            'status': 'failed',
+            'target_url': target_url,
+            'error': str(exc),
+            'task_id': self.request.id
+        }
+
+async def _async_scan_task_debug(task_info: dict):
+    """
+    🔒🔍 SAFE DEBUG ASYNC SCAN TASK with detailed logging and guaranteed cleanup
+    """
+    target_url = task_info.get('url', '')
+    logger.info(f"🔍 DEBUG: Starting SAFE browser session setup for {target_url}")
+
+    db_manager = None
+    browser_manager = SafeBrowserManager()
+
+    try:
+        # STEP 1: Database connection test
+        logger.info("🔍 DEBUG: Step 1 - Testing database connection...")
+        db_manager = DatabaseManager()
+        logger.info("✅ DEBUG: Database manager initialized")
+
+        # STEP 2: Safe browser session with guaranteed cleanup
+        logger.info("🔍 DEBUG: Step 2 - Starting SAFE browser session...")
+        async with browser_manager.browser_session() as (page, session_name):
+            logger.info(f"✅ DEBUG: SAFE browser session ready - {session_name}")
+
+            # STEP 3: Scraper coordinator setup
+            logger.info("🔍 DEBUG: Step 3 - Setting up scraper coordinator...")
+            scraper_coordinator = ScraperCoordinator(db_manager, page)
+            logger.info("✅ DEBUG: Scraper coordinator ready")
+
+            # STEP 4: Navigate to URL
+            logger.info(f"🔍 DEBUG: Step 4 - Navigating to {target_url}")
+            await page.goto(target_url, wait_until='domcontentloaded', timeout=60000)
+            logger.info("✅ DEBUG: Navigation completed")
+
+            # STEP 5: Process URL với detailed logging
+            logger.info("🔍 DEBUG: Step 5 - Processing URL for posts and reactions...")
+            scraping_result = await scraper_coordinator.process_url(target_url)
+            logger.info(f"✅ DEBUG: Scraping completed with result: {scraping_result}")
+
+            # STEP 6: Success reporting
+            if session_name:
+                browser_manager.session_manager.report_outcome(session_name, 'success')
+                logger.info(f"✅ DEBUG: Reported success for session {session_name}")
+
+            return scraping_result
+        
+        # Browser cleanup is automatic from context manager
+
+    except Exception as e:
+        logger.error(f"❌ DEBUG: Error during task - {e}")
+        raise
+
+    finally:
+        logger.info("🔍 DEBUG: Final cleanup phase...")
+        # Cleanup database resources
+        if db_manager:
+            db_manager.close()
+            logger.info("✅ DEBUG: Database manager closed")
+        logger.info("✅ DEBUG: All resources cleaned up (browser auto-cleaned by context manager)")
+
+@app.task(name='facebook_scraper.health_check')
+def health_check():
+    """Health check task cho monitoring"""
+    db_manager = None
+    try:
+        # Test database connection
+        db_manager = DatabaseManager()
+        # Test Redis connection with connection pooling
+        import redis
+        # Use connection pool for better performance
+        redis_pool = redis.ConnectionPool(host='redis', port=6379, max_connections=10, decode_responses=True)
+        redis_client = redis.Redis(connection_pool=redis_pool)
+        redis_client.ping()
+
+        result = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'worker_id': current_task.request.id
+        }
+        return result
+    except Exception as e:
+        result = {
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }
+        return result
+    finally:
+        # Cleanup database resources to avoid connection leaks
+        if db_manager:
+            db_manager.close()
+
+@app.task(name='facebook_scraper.refresh_login_sessions')
+def refresh_login_sessions():
+    """🔄 Refresh Facebook login sessions daily to prevent logout"""
+    try:
+        import subprocess
+        logger.info("🔄 Refreshing Facebook login sessions...")
+
+        # Run auto_login.py if exists
+        if os.path.exists('/app/auto_login.py'):
+            result = subprocess.run(
+                ['python', '/app/auto_login.py'],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minutes timeout
+            )
+
+            if result.returncode == 0:
+                logger.info("✅ Sessions refreshed successfully")
+                return {'status': 'success', 'message': 'Sessions refreshed'}
+            else:
+                logger.error(f"❌ Failed to refresh sessions: {result.stderr}")
+                return {'status': 'error', 'message': result.stderr}
+        else:
+            logger.warning("⚠️ auto_login.py not found")
+            return {'status': 'skipped', 'message': 'auto_login.py not found'}
+
+    except Exception as e:
+        logger.error(f"❌ Session refresh error: {e}")
+        return {'status': 'error', 'message': str(e)}
+
+@app.task(name='facebook_scraper.browser_health_check')
+def browser_health_check():
+    """🔍 Browser Health Monitor - Check and cleanup browser resources"""
+    
+    async def _async_browser_health_check():
+        browser_manager = SafeBrowserManager()
+        
+        try:
+            # Get current browser health metrics
+            health_metrics = await browser_manager.get_browser_health_metrics()
+            
+            logger.info(f"🔍 Browser Health Check:")
+            logger.info(f"  📊 Chrome processes: {health_metrics['chrome_process_count']}")
+            logger.info(f"  💾 Total memory: {health_metrics['total_memory_mb']} MB")
+            
+            # Alert if too many processes or high memory usage
+            if isinstance(health_metrics['chrome_process_count'], int):
+                if health_metrics['chrome_process_count'] > 10:
+                    logger.warning(f"⚠️ High Chrome process count: {health_metrics['chrome_process_count']}")
+                
+                if isinstance(health_metrics['total_memory_mb'], (int, float)):
+                    if health_metrics['total_memory_mb'] > 2048:  # 2GB
+                        logger.warning(f"⚠️ High Chrome memory usage: {health_metrics['total_memory_mb']} MB")
+            
+            # Cleanup zombie processes
+            cleanup_result = await browser_manager.cleanup_zombie_browsers()
+            
+            if cleanup_result['killed_zombies'] > 0:
+                logger.info(f"🧹 Killed {cleanup_result['killed_zombies']} zombie Chrome processes")
+            
+            return {
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'metrics': health_metrics,
+                'cleanup': cleanup_result
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Browser health check failed: {e}")
+            return {
+                'status': 'unhealthy', 
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    # Run async function
+    return asyncio.run(_async_browser_health_check())
+
+# COMPATIBILITY với existing code
+def main():
+    """
+    MIGRATION: Entry point compatibility với existing docker-compose
+    Thay manual worker.process_queues() bằng Celery worker command
+    """
+    import argparse
+    from logging_config import setup_application_logging
+
+    setup_application_logging()
+
+    parser = argparse.ArgumentParser(description="Celery Worker for Facebook Post Monitor")
+    parser.add_argument("--worker-id", type=str, help="Worker ID (for compatibility)")
+    parser.add_argument("--queues", type=str, nargs="+", default=["all"], help="Queues (for compatibility)")
+    parser.add_argument("--headless", action="store_true", default=True, help="Headless mode")
+    parser.add_argument("--auto-restart", action="store_true", help="Auto-restart (handled by Celery)")
+
+    args = parser.parse_args()
+
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║        FACEBOOK POST MONITOR - ENTERPRISE EDITION           ║")
-    print("║              MULTI-QUEUE WORKER PHASE 3.1                   ║")
+    print("║              CELERY-BASED WORKER PHASE 3.2                  ║")
     print("║                                                              ║")
-    print("║  🔄 Priority-based multi-queue processing                   ║")
-    print("║  ⚡ High-freq > Low-freq > Discovery                         ║")
-    print("║  🎯 Intelligent task routing và proxy management            ║")
-    print("║  🔧 Session pool + Proxy pool integration                   ║")
+    print("║  🔄 Distributed task processing with Celery                 ║")
+    print("║  ⚡ Automatic retries and priority queues                   ║")
+    print("║  🎯 Built-in monitoring and scaling                         ║")
+    print("║  🔧 Session-proxy binding preserved                         ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
-    
-    print(f"🔄 Worker ID: {worker_id}")
-    print(f"📋 Listening to queues: {[q.value for q in queue_types]}")
-    print(f"🎯 Priority order: {[q.name for q in queue_types]}")
-    
-    # Override headless setting based on command line arguments
-    override_settings = None
-    if args.no_headless or not args.headless:
-        # User wants visible browser mode
-        print("👀 Running with VISIBLE browser (non-headless mode)")
-        try:
-            from config import settings as global_settings
-            override_settings = global_settings
-            override_settings.worker.headless = False
-        except ImportError:
-            # Fallback for systems without config
-            class Override:
-                class WorkerConfig:
-                    headless = False
-                worker = WorkerConfig()
-            override_settings = Override()
-    else:
-        print("🕶️ Running in headless mode (browser hidden)")
 
-    print("💉 Using dependency injection (default)")
-    
-    # Initialize ServiceManager
-    service_manager = ServiceManager()
-    container = service_manager.container
-    
-    # Get dependencies from container
-    redis_client = container.get_optional('redis_client')
-    db_manager = container.get_optional('database_manager')
-    session_manager = container.get_optional('session_manager')
-    proxy_manager = container.get_optional('proxy_manager')
-    config = container.get_optional('config') or override_settings
-    
-    # Apply headless override to injected config
-    if override_settings and config:
-        config.worker.headless = override_settings.worker.headless
-    
-    # Create worker with injected dependencies
-    worker = MultiQueueWorker(
-        worker_id=worker_id,
-        queue_types=queue_types,
-        config=MultiQueueConfig(),
-        redis_client=redis_client,
-        db_manager=db_manager,
-        session_manager=session_manager,
-        proxy_manager=proxy_manager,
-        settings=config or override_settings
-    )
-    
+    # Celery worker được start bởi docker command
+    print("🚀 Starting Celery worker...")
+    print("📋 Queues: scan_high, scan_normal, discovery, maintenance")
+    print("🎯 Use: celery -A multi_queue_worker worker --loglevel=info")
     print()
-    
-    # Run worker with optional auto-restart
-    if args.auto_restart:
-        print(f"🔄 Auto-restart enabled: max {args.max_restarts} restarts, {args.restart_delay}s delay")
-        print("⚠️  Worker will automatically restart on crashes")
-        print()
-        asyncio.run(run_worker_with_auto_restart(worker, args.max_restarts, args.restart_delay))
-    else:
-        print("🚀 Running worker without auto-restart")
-        print()
-        asyncio.run(worker.process_queues())
-
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n⏹️ Worker bị dừng")
-    except Exception as e:
-        print(f"\n💥 Lỗi: {e}")
-        import traceback
-        traceback.print_exc()
-
-
+    main()

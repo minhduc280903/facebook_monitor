@@ -193,6 +193,13 @@ class SessionManager:
         # Resource pool (in-memory cache)
         self.resource_pool: Dict[str, ManagedResource] = {}
         
+        # 🔧 PERFORMANCE OPTIMIZATION: Batch file writes to reduce I/O
+        self.pending_file_sync = False
+        self.last_file_sync_time = datetime.now()
+        self.file_sync_interval_seconds = 5  # Write to file max once per 5 seconds
+        self.file_sync_change_threshold = 10  # Or after 10 changes
+        self.changes_since_last_sync = 0
+        
         # 🔗 PRODUCTION FIX: Session-Proxy binding
         from .session_proxy_binder import SessionProxyBinder
         self.proxy_binder = SessionProxyBinder("session_proxy_bindings.json")
@@ -449,12 +456,38 @@ class SessionManager:
             logger.error(f"❌ Lỗi ghi session status: {e}")
             raise
     
-    def _sync_resources_to_file(self):
-        """Sync in-memory resources back to file."""
-        status_data = {}
-        for resource_id, resource in self.resource_pool.items():
-            status_data[resource_id] = resource.to_dict()
-        self._write_status_file(status_data)
+    def _sync_resources_to_file(self, force: bool = False):
+        """
+        Sync in-memory resources back to file with batching optimization.
+        
+        Args:
+            force: If True, sync immediately regardless of batching rules
+        """
+        # Track that a change was made
+        self.changes_since_last_sync += 1
+        self.pending_file_sync = True
+        
+        # Determine if we should write now
+        current_time = datetime.now()
+        time_elapsed = (current_time - self.last_file_sync_time).total_seconds()
+        
+        should_sync = (
+            force or  # Forced sync
+            time_elapsed >= self.file_sync_interval_seconds or  # Time-based
+            self.changes_since_last_sync >= self.file_sync_change_threshold  # Change-based
+        )
+        
+        if should_sync and self.pending_file_sync:
+            status_data = {}
+            for resource_id, resource in self.resource_pool.items():
+                status_data[resource_id] = resource.to_dict()
+            self._write_status_file(status_data)
+            
+            # Reset tracking
+            self.pending_file_sync = False
+            self.last_file_sync_time = current_time
+            self.changes_since_last_sync = 0
+            logger.debug(f"📝 Synced {len(status_data)} resources to file")
     
     def checkout_session(self, timeout: int = 30) -> Optional[str]:
         """
@@ -528,16 +561,17 @@ class SessionManager:
                 # Thread + process safe checkout with shorter lock duration
                 with self.lock:
                     if self.file_lock:
-                        # Use timeout on file lock to prevent indefinite blocking
-                        try:
-                            with self.file_lock.acquire(timeout=2):  # 2 second file lock timeout
-                                result = self._checkout_session_with_bound_proxy(proxy_manager)
-                                if result:
-                                    self._sync_resources_to_file()
-                                    return result
-                        except:
-                            # File lock timeout, continue to next attempt
-                            pass
+                    # Use timeout on file lock to prevent indefinite blocking
+                    try:
+                        with self.file_lock.acquire(timeout=10):  # Increased to 10 seconds for high-contention environments
+                            result = self._checkout_session_with_bound_proxy(proxy_manager)
+                            if result:
+                                self._sync_resources_to_file()
+                                return result
+                    except Exception as e:
+                        # File lock timeout, continue to next attempt
+                        logger.debug(f"File lock acquire timeout: {e}")
+                        pass
                     else:
                         result = self._checkout_session_with_bound_proxy(proxy_manager)
                         if result:
@@ -718,6 +752,7 @@ class SessionManager:
                 if not os.path.exists(session_path) or not self._is_valid_session_folder(session_path):
                     logger.warning(f"⚠️ Session invalid: {resource_id}")
                     resource.status = "NEEDS_LOGIN"
+                    self.changes_since_last_sync += 1  # Track change for batching
                     continue
                 
                 available_sessions.append(resource)
@@ -1186,9 +1221,9 @@ class SessionManager:
             
             if self.file_lock:
                 with self.file_lock:
-                    self._sync_resources_to_file()
+                    self._sync_resources_to_file(force=True)  # Force immediate sync for reset
             else:
-                self._sync_resources_to_file()
+                self._sync_resources_to_file(force=True)
             
             logger.info("🔄 Reset tất cả sessions về READY")
     
@@ -1200,9 +1235,9 @@ class SessionManager:
             self._process_cooldowns()
             if self.file_lock:
                 with self.file_lock:
-                    self._sync_resources_to_file()
+                    self._sync_resources_to_file(force=True)  # Force sync for cooldown updates
             else:
-                self._sync_resources_to_file()
+                self._sync_resources_to_file(force=True)
     
     def increment_failure_count(self, session_name: str, threshold: int = 3) -> bool:
         """

@@ -47,6 +47,7 @@ services:
     volumes:
       - ./logs:/app/logs
 
+  # MIGRATION: Celery Beat scheduler thay cho manual scheduler
   scheduler:
     build: .
     container_name: facebook-monitor-scheduler
@@ -60,14 +61,16 @@ services:
       - ./.env
     volumes:
       - ./logs:/app/logs
-    command: ["python", "scan_scheduler.py"]
+    # CHANGED: Celery Beat command thay cho python scan_scheduler.py
+    command: ["celery", "-A", "multi_queue_worker", "beat", "--loglevel=info"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping(); print('OK')"]
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping(); print('Beat OK')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
 
+  # MIGRATION: Celery worker thay cho manual MultiQueueWorker
   worker:
     build: .
     container_name: facebook-monitor-worker
@@ -81,13 +84,36 @@ services:
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
       - ./targets.json:/app/targets.json
-    command: ["python", "multi_queue_worker.py", "--queues", "scan", "--auto-restart", "--headless"]
+      - ./auto_login.py:/app/auto_login.py:ro
+      - ./account.txt:/app/account.txt:ro
+    # CHANGED: Celery worker command với priority queues
+    # Concurrency increased to 3 for better throughput (adjust based on available sessions/proxies)
+    command: ["celery", "-A", "multi_queue_worker", "worker", "--loglevel=info", "--queues=scan_high,scan_normal,discovery,maintenance", "--concurrency=3"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis', port=6379); r.ping(); print('Worker OK')"]
+      test: ["CMD", "python", "-c", "from multi_queue_worker import health_check; print('Worker OK')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 90s
+
+  # ADDED: Flower monitoring UI
+  flower:
+    build: .
+    container_name: facebook-monitor-flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    env_file:
+      - ./.env
+    command: ["celery", "-A", "multi_queue_worker", "flower", "--port=5555"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/", "||", "exit", "1"]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
 
   streamlit:
     build: .

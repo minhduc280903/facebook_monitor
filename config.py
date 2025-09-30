@@ -21,9 +21,9 @@ from pydantic import Field
 class DatabaseConfig(BaseSettings):
     """PostgreSQL database configuration settings"""
 
-    # PostgreSQL Configuration
+    # PostgreSQL Configuration - Docker-aware
     host: str = Field(
-        default="postgres",
+        default="postgres",  # Docker service name (fallback localhost for local)
         description="PostgreSQL server host"
     )
     port: int = Field(
@@ -177,7 +177,7 @@ class RedisConfig(BaseSettings):
     """Redis configuration settings"""
 
     host: str = Field(
-        default="redis",
+        default="redis",  # Docker service name (fallback localhost for local)
         description="Redis server host"
     )
     port: int = Field(
@@ -238,6 +238,20 @@ class ScrapingConfig(BaseSettings):
     max_scroll_hours: int = Field(
         default=24,
         description="Maximum hours to scroll when unlimited_mode=True"
+    )
+    
+    # Rate limiting to avoid Facebook detection/blocking
+    min_delay_between_requests: float = Field(
+        default=2.0,
+        description="Minimum delay between requests to avoid rate limiting (seconds)"
+    )
+    max_requests_per_minute: int = Field(
+        default=20,
+        description="Maximum requests per minute per session"
+    )
+    max_scrolls_per_session: int = Field(
+        default=100,
+        description="Maximum scroll operations per session to avoid detection"
     )
     
     post_processing_delay_min: float = Field(

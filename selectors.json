@@ -60,21 +60,45 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": "//*[contains(text(), 'All reactions:')]/parent::*",
+        "path": "//div[@aria-label[contains(., 'Thích: ') and contains(., 'người')]]",
         "priority": 1,
-        "description": "TOTAL REACTIONS: Parent element với full text 'All reactions:X' - EXTRACTS TOTAL REACTIONS (Sept 18, 2025)"
+        "description": "🎯 NEW: Direct aria-label match 'Thích: X người' - Sept 29, 2025"
       },
       {
         "type": "xpath",
-        "path": "//span[contains(@aria-label, 'cảm xúc')]/ancestor::div[1][contains(text(), 'Tất cả cảm xúc:')]",
-        "priority": 2, 
-        "description": "TOTAL REACTIONS: Direct parent with reaction count text (Vietnamese) - VERIFIED WORKING"
+        "path": "//div[@role='button'][@aria-label[contains(., 'Thích: ') and contains(., 'người')]]",
+        "priority": 2,
+        "description": "🎯 NEW: Button with aria-label 'Thích: X người' - Sept 29, 2025"
+      },
+      {
+        "type": "xpath",
+        "path": "//span[@aria-label[contains(., 'cảm xúc')]]//following-sibling::div//span[contains(@class, 'xt0b8zv')]",
+        "priority": 3,
+        "description": "🎯 NEW: Total reactions number after emotion toolbar - Sept 29, 2025"
+      },
+      {
+        "type": "xpath",
+        "path": "//div[contains(text(), 'Tất cả cảm xúc:')]",
+        "priority": 4,
+        "description": "🎯 NEW: Vietnamese 'Tất cả cảm xúc:X' text - Sept 29, 2025"
+      },
+      {
+        "type": "xpath", 
+        "path": "//*[contains(text(), 'All reactions:')]/ancestor::*[contains(text(), 'All reactions:') and contains(text(), 'Like')][1]",
+        "priority": 5,
+        "description": "🎯 TOTAL REACTIONS: Parent element containing both 'All reactions:X' and 'Like' - Sept 27, 2025"
+      },
+      {
+        "type": "xpath",
+        "path": "//*[contains(text(), 'All reactions:')]/parent::*[contains(text(), 'All reactions:')]",
+        "priority": 2,
+        "description": "🎯 TOTAL REACTIONS: Parent of 'All reactions:' label containing full text - Sept 27, 2025"
       },
       {
         "type": "xpath", 
         "path": "//span[contains(@aria-label, 'cảm xúc')]/parent::*//*[contains(text(), 'Tất cả cảm xúc:') and contains(text(), ':')]",
         "priority": 3,
-        "description": "TOTAL REACTIONS: Parent containing 'Tất cả cảm xúc:X' with colon (FIXED)"
+        "description": "🟢 FALLBACK: Parent containing 'Tất cả cảm xúc:X' with colon - VERIFIED Sept 2025"
       },
       {
         "type": "xpath",
@@ -216,27 +240,27 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": "//div[@role='article']//div[string-length(normalize-space(text())) > 15]",
+        "path": "//span[string-length(normalize-space(text())) > 20 and not(contains(text(), 'Like')) and not(contains(text(), 'Comment'))]",
         "priority": 1,
+        "description": "🟢 WORKING: Content spans (fallback for different post types) - VERIFIED Sept 2025"
+      },
+      {
+        "type": "xpath",
+        "path": "//div[@role='article']//div[string-length(normalize-space(text())) > 15]",
+        "priority": 2,
         "description": "Content-rich divs - VERIFIED WORKING (Sept 2025)"
       },
       {
         "type": "xpath",
         "path": "//div[string-length(normalize-space(text())) > 30 and not(contains(text(), 'ago')) and not(contains(text(), 'Like')) and not(contains(text(), 'Share'))]",
-        "priority": 2,
+        "priority": 3,
         "description": "Flexible content detection - VERIFIED WORKING (Sept 2025)"
       },
       {
         "type": "css",
         "path": "div[data-ad-preview='message']",
-        "priority": 3,
-        "description": "Primary message container (OUTDATED - FB changed structure)"
-      },
-      {
-        "type": "xpath",
-        "path": "//span[string-length(normalize-space(text())) > 20 and not(contains(text(), 'Like')) and not(contains(text(), 'Comment'))]",
         "priority": 4,
-        "description": "Content spans (fallback for different post types)"
+        "description": "Primary message container (OUTDATED - FB changed structure)"
       },
       {
         "type": "css",
