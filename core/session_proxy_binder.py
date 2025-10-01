@@ -145,7 +145,7 @@ class SessionProxyBinder:
                 return self._get_or_assign_proxy(session_name, available_proxies)
 
     def _get_or_assign_proxy(self, session_name: str, available_proxies: List[str]) -> Optional[str]:
-        """Internal method để get hoặc assign proxy"""
+        """Internal method để get hoặc assign proxy - FIXED: NO AUTO-ROTATION"""
         try:
             # Check nếu session đã có proxy được bind
             existing_proxy = self.bindings_cache.get(session_name)
@@ -155,9 +155,17 @@ class SessionProxyBinder:
                 return existing_proxy
 
             if existing_proxy and existing_proxy not in available_proxies:
-                logger.warning(f"⚠️ Bound proxy {existing_proxy} not available for session {session_name}")
+                # ✅ FIX: ORPHAN BINDING detected - cleanup and assign new proxy
+                logger.error(f"❌ ORPHAN BINDING: proxy {existing_proxy} not in pool for session {session_name}")
+                logger.info(f"🧹 Removing orphan binding and will assign new proxy from {len(available_proxies)} available")
+                
+                # Remove orphan binding from cache
+                del self.bindings_cache[session_name]
+                self._sync_bindings_to_file()
+                
+                # Fall through to assign new proxy below (existing_proxy is now None effectively)
 
-            # Assign proxy mới nếu chưa có binding hoặc proxy cũ không available
+            # ONLY assign proxy mới nếu session CHƯA CÓ binding (first-time setup)
             if not available_proxies:
                 logger.warning(f"⚠️ No available proxies to bind with session {session_name}")
                 return None

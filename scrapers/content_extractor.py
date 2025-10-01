@@ -308,15 +308,25 @@ class ContentExtractor:
         
         text_lower = text.lower().strip()
         
-        # Danh sách patterns theo thứ tự ưu tiên
+        # Danh sách patterns theo thứ tự ưu tiên - REACTIONS + COMMENTS
         patterns = [
-            r'thích:\s*(\d+[\.,]?\d*)([km]?)\s*người',        # Vietnamese "Thích: 1 người"  
-            r'like:\s*(\d+[\.,]?\d*)([km]?)\s*(?:people?|person)', # English "Like: 1 person"
-            r'all reactions?:\s*(\d+[\.,]?\d*)([km]?)',        # English "All reactions:123"
-            r'tất cả cảm xúc:\s*(\d+[\.,]?\d*)([km]?)',       # Vietnamese
-            r'(\d+[\.,]?\d*)([km]?)\s*(?:người|người đã.*)', # "10 người" or "10 người đã..."
-            r'(\d+[\.,]?\d*)([km]?)\s*(?:likes?|reactions?)', # "123K likes"
-            r'(\d+[\.,]?\d*)([km]?)'                          # Fallback: any number
+            # REACTIONS (total reactions count)
+            r'all\s+reactions?:\s*(\d+[\.,]?\d*)([km]?)',        # English "All reactions: 3" (PRIORITY 1)
+            r'tất cả cảm xúc:\s*(\d+[\.,]?\d*)([km]?)',          # Vietnamese "Tất cả cảm xúc: 3" (PRIORITY 2)
+            r'(\d+[\.,]?\d*)([km]?)\s*cảm\s*xúc',               # "3 cảm xúc" (Vietnamese reverse)
+            r'(\d+[\.,]?\d*)([km]?)\s*reactions?',               # "3 reactions" (English reverse)
+            
+            # COMMENTS (OCT 1 2025 FIX)
+            r'(\d+[\.,]?\d*)([km]?)\s*bình\s*luận',             # "13 bình luận" (Vietnamese)
+            r'(\d+[\.,]?\d*)([km]?)\s*comments?',                # "13 comments" (English)
+            r'bình\s*luận:\s*(\d+[\.,]?\d*)([km]?)',            # "Bình luận: 13" (Vietnamese reverse)
+            r'comments?:\s*(\d+[\.,]?\d*)([km]?)',               # "Comments: 13" (English reverse)
+            
+            # SHARES (for completeness)
+            r'(\d+[\.,]?\d*)([km]?)\s*(lượt\s*)?chia\s*sẻ',     # "18 lượt chia sẻ" or "18 chia sẻ" (Vietnamese)
+            r'(\d+[\.,]?\d*)([km]?)\s*shares?',                  # "18 shares" (English)
+            
+            r'(\d+[\.,]?\d*)([km]?)'                             # Fallback: any number
         ]
         
         for pattern in patterns:

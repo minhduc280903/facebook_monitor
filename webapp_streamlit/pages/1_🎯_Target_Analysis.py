@@ -201,7 +201,7 @@ def main():
                 st.dataframe(
                     display_df[selected_columns],
                     column_config=column_config,
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True
                 )
                 
@@ -220,7 +220,7 @@ def main():
                         labels={'source_name': 'Target', 'total_viral_score': 'Total Viral Score'}
                     )
                     fig_viral.update_xaxes(tickangle=45)
-                    st.plotly_chart(fig_viral, use_container_width=True)
+                    st.plotly_chart(fig_viral, width='stretch')
                 
                 with col2:
                     # Posts vs Performance
@@ -236,7 +236,7 @@ def main():
                             'avg_viral_score': 'Average Viral Score'
                         }
                     )
-                    st.plotly_chart(fig_performance, use_container_width=True)
+                    st.plotly_chart(fig_performance, width='stretch')
                 
         except Exception as e:
             st.error(f"❌ Lỗi load comparison data: {e}")
@@ -309,7 +309,7 @@ def main():
                 
                 st.dataframe(
                     final_df,
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     column_config={
                         "Nội dung": st.column_config.TextColumn(width="large"),
@@ -340,7 +340,7 @@ def main():
                         title="📅 Posts Timeline",
                         labels={'date': 'Date', 'post_count': 'Number of Posts'}
                     )
-                    st.plotly_chart(fig_timeline, use_container_width=True)
+                    st.plotly_chart(fig_timeline, width='stretch')
                 
                 with col2:
                     # Author performance
@@ -358,7 +358,7 @@ def main():
                         labels={'author': 'Author', 'total_viral': 'Total Viral Score'}
                     )
                     fig_authors.update_xaxes(tickangle=45)
-                    st.plotly_chart(fig_authors, use_container_width=True)
+                    st.plotly_chart(fig_authors, width='stretch')
                 
         except Exception as e:
             st.error(f"❌ Lỗi load target data: {e}")

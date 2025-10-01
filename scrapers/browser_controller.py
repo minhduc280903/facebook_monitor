@@ -67,19 +67,25 @@ class BrowserController:
                 logger.debug(f"🧭 Điều hướng đến: {url} (Lần thử {attempt + 1}/{retries})")
                 await self.page.goto(url, wait_until='domcontentloaded', timeout=45000)
                 
-                # Check for CAPTCHA after navigation
-                if await self.is_captcha_present():
-                    logger.error("🛑 CAPTCHA detected after navigation")
-                    raise CaptchaException("CAPTCHA present after navigation")
-                
-                # FIX: Handle security checkpoints
+                # CRITICAL: Check checkpoint FIRST (before CAPTCHA check)
+                # Checkpoint pages may contain CAPTCHA elements → false positive
+                checkpoint_resolved = False
                 if "checkpoint" in self.page.url:
                     logger.warning("🔐 Facebook security checkpoint detected. Attempting to resolve...")
                     checkpoint_resolved = await self.handle_checkpoint()
                     if not checkpoint_resolved:
                         logger.error("❌ Failed to resolve security checkpoint.")
-                        return False
+                        # Mark as CAPTCHA to quarantine proxy
+                        raise CaptchaException("Facebook security checkpoint - failed to resolve")
                     logger.info("✅ Checkpoint resolved successfully. Continuing navigation...")
+                    # After resolving, wait a bit for potential redirect
+                    await asyncio.sleep(2)
+                
+                # Check for CAPTCHA ONLY if checkpoint was NOT resolved
+                # (If checkpoint resolved, we trust that content is accessible)
+                if not checkpoint_resolved and await self.is_captcha_present():
+                    logger.error("🛑 CAPTCHA detected after navigation")
+                    raise CaptchaException("CAPTCHA present after navigation")
 
                 # Wait for first post to appear (if we have selectors)
                 if hasattr(self, 'selectors') and self.selectors:
@@ -231,32 +237,67 @@ class BrowserController:
     
     async def handle_checkpoint(self) -> bool:
         """
-        Handles the 'Help us confirm it's you' security checkpoint.
+        Enhanced checkpoint handler with multiple strategies
         
         Returns:
-            bool: True if the checkpoint was resolved successfully, False otherwise.
+            bool: True if resolved or can proceed, False if blocked
         """
+        import asyncio
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        
         try:
-            # Look for a 'Continue' button, accommodating different languages.
-            continue_button_selector = "button:has-text('Continue'), button:has-text('Tiếp tục')"
-            continue_button = self.page.locator(continue_button_selector).first
+            logger.info(f"🔍 Analyzing checkpoint: {self.page.url}")
+            await asyncio.sleep(2)
             
-            if await continue_button.is_visible(timeout=10000):
-                logger.info("🖱️ Found 'Continue' button on checkpoint page. Clicking it now.")
-                await continue_button.click()
-                
-                # Wait for the navigation away from the checkpoint URL.
-                await self.page.wait_for_url(lambda url: "checkpoint" not in url, timeout=30000)
-                logger.info("✅ Successfully navigated away from the checkpoint page.")
-                return True
-            else:
-                logger.warning("⚠️ Could not find a 'Continue' button on the checkpoint page.")
-                return False
-        except PlaywrightTimeoutError:
-            logger.error("⏳ Timed out waiting for navigation after clicking 'Continue'. Checkpoint may not be resolved.")
+            # Strategy 1: Look for Continue button
+            continue_selectors = [
+                "button:has-text('Continue')",
+                "button:has-text('Tiếp tục')",
+                "div[role='button']:has-text('Continue')",
+                "a:has-text('Continue')"
+            ]
+            
+            for selector in continue_selectors:
+                try:
+                    button = self.page.locator(selector).first
+                    if await button.count() > 0:
+                        visible = await button.is_visible(timeout=5000)
+                        if visible:
+                            logger.info(f"✅ Clicking: {selector}")
+                            await button.click()
+                            await asyncio.sleep(3)
+                            
+                            if "checkpoint" not in self.page.url:
+                                logger.info("🎉 Checkpoint resolved!")
+                                return True
+                except Exception:
+                    continue
+            
+            # Strategy 2: Check for 'Not Now' on save device checkpoint
+            try:
+                not_now = self.page.locator("text='Not Now', text='Không phải bây giờ'").first
+                if await not_now.count() > 0:
+                    await not_now.click()
+                    await asyncio.sleep(2)
+                    return True
+            except Exception:
+                pass
+            
+            # Strategy 3: Check if content is accessible despite checkpoint
+            content_indicators = ["div[role='main']", "div[role='feed']", "article"]
+            for indicator in content_indicators:
+                try:
+                    if await self.page.query_selector(indicator):
+                        logger.info(f"💡 Non-blocking checkpoint, found content: {indicator}")
+                        return True
+                except Exception:
+                    continue
+            
+            logger.error("❌ Checkpoint could not be resolved")
             return False
+            
         except Exception as e:
-            logger.error(f"❌ An unexpected error occurred while handling the checkpoint: {e}")
+            logger.error(f"❌ Checkpoint handler error: {e}")
             return False
 
     async def get_page_info(self) -> dict:

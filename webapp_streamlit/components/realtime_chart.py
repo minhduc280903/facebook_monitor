@@ -428,7 +428,7 @@ def create_realtime_chart_component():
         # Auto-refresh chart
         chart_placeholder = st.empty()
         with chart_placeholder.container():
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_{post_signature}")
+            st.plotly_chart(fig, width='stretch', key=f"chart_{post_signature}")
         
         # Show last update time
         if post_signature in chart.last_update:
@@ -441,7 +441,7 @@ def create_realtime_chart_component():
         st.markdown("### 📊 System Overview")
         
         stats_fig = chart.create_system_overview_chart(chart.system_stats)
-        st.plotly_chart(stats_fig, use_container_width=True, key="system_overview")
+        st.plotly_chart(stats_fig, width='stretch', key="system_overview")
 
 
 def create_forex_dashboard():

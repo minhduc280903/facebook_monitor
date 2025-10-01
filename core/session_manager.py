@@ -498,7 +498,8 @@ class SessionManager:
         """
         ✅ FIX RACE CONDITION: Atomically check if session is available and mark as IN_USE.
         
-        This method is thread-safe and prevents multiple workers from checking out the same session.
+        CRITICAL: This method uses CROSS-PROCESS FileLock to prevent multiple Celery workers
+        from checking out the same session simultaneously.
         
         Args:
             session_name: Name of session to mark
@@ -506,7 +507,11 @@ class SessionManager:
         Returns:
             True if successfully marked as IN_USE, False if already taken or unavailable
         """
-        with self.lock:
+        # 🔒 CRITICAL: Use FileLock for cross-process atomicity (not just threading.Lock!)
+        with self.locks():
+            # Reload from file to get latest status from other processes
+            self._load_resources_to_memory()
+            
             if session_name not in self.resource_pool:
                 return False
             
@@ -523,6 +528,9 @@ class SessionManager:
             # Mark as IN_USE atomically
             session_resource.status = "IN_USE"
             session_resource.last_used_timestamp = datetime.now()
+            
+            # Write immediately to file so other processes see it
+            self._sync_resources_to_file(force=True)
             
             return True
     
@@ -617,8 +625,14 @@ class SessionManager:
             self._process_cooldowns()
             
             while time.time() - start_time < timeout:
-                # Try each available session
-                for session_name, session_resource in list(self.resource_pool.items()):
+                # Try each available session with ROTATION
+                # Sort sessions by last_used_timestamp (least recently used first) for fair rotation
+                sorted_sessions = sorted(
+                    self.resource_pool.items(),
+                    key=lambda x: x[1].last_used_timestamp or datetime.min
+                )
+                
+                for session_name, session_resource in sorted_sessions:
                     # Skip if in use or quarantined
                     if session_resource.status == "IN_USE" or session_resource.is_quarantined():
                         continue
@@ -628,103 +642,59 @@ class SessionManager:
                         continue
                     
                     try:
-                        # Get available proxy IDs from proxy manager - WITH HEALTH CHECK
-                        available_proxy_ids = []
+                        # 🚀 SIMPLE: Lấy danh sách proxy READY
+                        ready_proxy_ids = [
+                            pid for pid, pres in proxy_manager.resource_pool.items()
+                            if pres.status == "READY" and pres.metadata.get("config")
+                        ]
                         
-                        # CRITICAL FIX: In Docker, skip health check to avoid blocking all proxies
-                        is_docker = os.environ.get('DOCKER_ENV') == 'true' or os.path.exists('/.dockerenv')
-                        
-                        logger.debug(f"🔍 Docker mode: {is_docker}, Total proxies in pool: {len(proxy_manager.resource_pool)}")
-                        
-                        for proxy_id, proxy_resource in proxy_manager.resource_pool.items():
-                            # Check proxy config exists
-                            proxy_config = proxy_resource.metadata.get("config", {})
-                            if not proxy_config:
-                                logger.warning(f"⚠️ Proxy {proxy_id} skipped - no config in metadata")
-                                continue
-                            
-                            # Check if proxy is quarantined
-                            if proxy_resource.is_quarantined():
-                                logger.debug(f"⚠️ Proxy {proxy_id} skipped - quarantined")
-                                continue
-                            
-                            # ✅ FIX: ALWAYS run health check with caching (both Docker & non-Docker)
-                            # Check if recently verified (within last 5 minutes) to avoid repeated checks
-                            last_checked = proxy_resource.metadata.get("last_checked")
-                            recently_verified = False
-                            if last_checked:
-                                try:
-                                    last_check_time = datetime.fromisoformat(last_checked)
-                                    if datetime.now() - last_check_time < timedelta(minutes=5):
-                                        recently_verified = True
-                                except Exception as e:
-                                    logger.debug(f"⚠️ Failed to parse last_checked time for proxy {proxy_id}: {e}")
-                            
-                            if recently_verified:
-                                available_proxy_ids.append(proxy_id)
-                                logger.debug(f"✅ Proxy {proxy_id} recently verified (cached), added")
-                            else:
-                                # Run health check for ALL proxies (Docker & non-Docker)
-                                proxy_config_copy = proxy_config.copy()
-                                proxy_config_copy["proxy_id"] = proxy_id
-                                
-                                if proxy_manager.health_check_proxy(proxy_config_copy):
-                                    # Update last_checked timestamp to cache result
-                                    proxy_resource.metadata["last_checked"] = datetime.now().isoformat()
-                                    available_proxy_ids.append(proxy_id)
-                                    logger.debug(f"✅ Proxy {proxy_id} verified healthy (Docker={is_docker})")
-                                else:
-                                    logger.warning(f"⚠️ Proxy {proxy_id} failed health check, skipping")
-                        
-                        if not available_proxy_ids:
-                            if is_docker:
-                                logger.error(f"❌ No proxies available even in Docker mode - check proxies.txt")
-                                logger.error(f"📊 Debug: total proxies in pool: {len(proxy_manager.resource_pool)}")
-                                for pid, pres in list(proxy_manager.resource_pool.items())[:3]:
-                                    logger.error(f"📊 Sample proxy {pid}: status={pres.status}, quarantined={pres.is_quarantined()}, has_config={bool(pres.metadata.get('config'))}")
+                        if not ready_proxy_ids:
+                            logger.debug(f"⚠️ No READY proxies available")
                             continue
                         
-                        # Get or assign bound proxy for this session
+                        # Get proxy đã bind hoặc bind mới (tự động xử lý)
                         bound_proxy_id = self.proxy_binder.get_proxy_for_session(
-                            session_name, available_proxy_ids
+                            session_name, ready_proxy_ids
                         )
                         
                         if not bound_proxy_id:
+                            logger.debug(f"⚠️ Session {session_name}: binding failed")
                             continue
                         
-                        # Checkout the bound proxy
+                        # Check proxy có READY không
                         proxy_resource = proxy_manager.resource_pool.get(bound_proxy_id)
                         if not proxy_resource:
-                            logger.warning(f"⚠️ Bound proxy {bound_proxy_id} not found in pool, trying next session")
+                            logger.warning(f"⚠️ Proxy {bound_proxy_id} not found")
                             continue
                         
-                        # In Docker mode, accept any non-quarantined proxy regardless of status
-                        if not is_docker and proxy_resource.status != "READY":
-                            logger.warning(f"⚠️ Bound proxy {bound_proxy_id} not ready (status: {proxy_resource.status}), trying next session")
+                        if proxy_resource.status != "READY":
+                            logger.debug(f"⚠️ Proxy {bound_proxy_id} not READY (status={proxy_resource.status})")
                             continue
                         
-                        # In Docker mode, check if proxy is quarantined
-                        if is_docker and proxy_resource.is_quarantined():
-                            logger.warning(f"⚠️ Bound proxy {bound_proxy_id} is quarantined in Docker mode, trying next session")
+                        if proxy_resource.is_quarantined():
+                            logger.debug(f"⚠️ Proxy {bound_proxy_id} quarantined")
                             continue
                         
-                        # Mark proxy as IN_USE
+                        proxy_config = proxy_resource.metadata.get("config")
+                        if not proxy_config:
+                            logger.warning(f"⚠️ Proxy {bound_proxy_id} no config")
+                            continue
+                        
+                        # ✅ ATOMICALLY mark session IN_USE (prevent race condition)
+                        if not self._atomic_try_mark_session_in_use(session_name):
+                            logger.debug(f"⚠️ Session {session_name} taken by another worker")
+                            continue
+                        
+                        # Mark proxy IN_USE
                         proxy_resource.status = "IN_USE"
                         proxy_resource.last_used_timestamp = datetime.now()
                         
-                        # Prepare proxy config
-                        proxy_config = proxy_resource.metadata.get("config", {}).copy()
-                        proxy_config["proxy_id"] = bound_proxy_id
+                        # Return session + proxy
+                        proxy_config_copy = proxy_config.copy()
+                        proxy_config_copy["proxy_id"] = bound_proxy_id
                         
-                        # ✅ FIX RACE CONDITION: Atomically mark session as IN_USE
-                        # This prevents multiple workers from checking out the same session
-                        if not self._atomic_try_mark_session_in_use(session_name):
-                            # Another worker grabbed this session, try next one
-                            logger.debug(f"⚠️ Session {session_name} was taken by another worker, trying next...")
-                            continue
-                        
-                        logger.info(f"🔗 Session-Proxy bound checkout: {session_name} -> {bound_proxy_id}")
-                        return (session_name, proxy_config)
+                        logger.info(f"✅ Checkout: {session_name} -> {bound_proxy_id}")
+                        return (session_name, proxy_config_copy)
                         
                     except Exception as e:
                         logger.error(f"❌ Error binding session {session_name}: {e}")

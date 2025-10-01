@@ -90,7 +90,8 @@ class LoggingConfig:
                 
                 try:
                     log_file.parent.mkdir(parents=True, exist_ok=True)
-                    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+                    # Use UTF-8 encoding with BOM for better Windows compatibility
+                    file_handler = logging.FileHandler(log_file, encoding='utf-8-sig', errors='replace')
                     file_handler.setFormatter(formatter)
                     logger.addHandler(file_handler)
                 except Exception as e:
@@ -109,10 +110,25 @@ class LoggingConfig:
 
             def format(self, record):
                 formatted = super().format(record)
-                # Strip Unicode emojis and special characters for Windows console compatibility
+                # Strip ONLY emojis, KEEP Vietnamese characters
                 import re
-                # Remove emojis and other problematic Unicode characters
-                formatted = re.sub(r'[^\x00-\x7F]+', '?', formatted)
+                # Remove emojis (U+1F000 to U+1F9FF, U+2600 to U+26FF, etc.)
+                # But KEEP Vietnamese (Latin Extended, Vietnamese diacritics)
+                emoji_pattern = re.compile(
+                    "["
+                    "\U0001F600-\U0001F64F"  # emoticons
+                    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                    "\U0001F680-\U0001F6FF"  # transport & map symbols
+                    "\U0001F700-\U0001F77F"  # alchemical symbols
+                    "\U0001F780-\U0001F7FF"  # Geometric Shapes Extended
+                    "\U0001F800-\U0001F8FF"  # Supplemental Arrows-C
+                    "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+                    "\U0001FA00-\U0001FA6F"  # Chess Symbols
+                    "\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
+                    "\U00002702-\U000027B0"  # Dingbats
+                    "\U000024C2-\U0001F251" 
+                    "]+", flags=re.UNICODE)
+                formatted = emoji_pattern.sub('', formatted)
                 return formatted
 
         formatters = {

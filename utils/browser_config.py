@@ -20,10 +20,10 @@ Browser Configuration for Facebook Post Monitor - Enterprise Edition
 
 from typing import Dict, List, Any, Optional
 
-# Constants for browser configuration
+# Constants for browser configuration  
 DEFAULT_USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 )
 DEFAULT_VIEWPORT_WIDTH = 1920
 DEFAULT_VIEWPORT_HEIGHT = 1080
@@ -83,6 +83,7 @@ def get_browser_launch_options(
         Complete browser launch configuration
     """
     import logging
+    import os
     logger = logging.getLogger(__name__)
     
     args = get_browser_args()

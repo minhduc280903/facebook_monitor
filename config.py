@@ -102,6 +102,10 @@ class WorkerConfig(BaseSettings):
         default=True,
         description="Run browser in headless mode"
     )
+    concurrency: int = Field(
+        default=0,
+        description="Number of concurrent workers (0 = auto-detect from sessions)"
+    )
     max_tasks_per_cleanup: int = Field(
         default=1000,
         description="Maximum tasks before cleanup"
@@ -297,7 +301,7 @@ class ScrapingConfig(BaseSettings):
     
     # Unlimited scraping settings for date-based collection
     unlimited_mode: bool = Field(
-        default=True,
+        default=False,  # ⚡ TEMP: Disabled for testing extraction
         description="Enable unlimited scraping based on start_date only"
     )
     max_posts_safety_limit: int = Field(

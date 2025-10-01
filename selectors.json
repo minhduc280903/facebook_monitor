@@ -1,53 +1,23 @@
 {
   "meta": {
-    "version": "4.2-debug-optimized",
-    "description": "Facebook Selectors - Optimized based on debug analysis with targeted comment and like count strategies",
-    "last_updated": "2025-09-23",
-    "breaking_changes": "Updated post_containers strategies to support modern Facebook HTML structure (September 2025)"
+    "version": "5.0-production-optimized",
+    "description": "Facebook Selectors - CLEANED - Only working strategies verified Oct 1 2025",
+    "last_updated": "2025-10-01",
+    "note": "All fallback strategies removed. Only confirmed working selectors."
   },
   "post_containers": {
     "strategies": [
       {
         "type": "css",
-        "path": "div[role='main'] > div > div > div > div",
-        "priority": 1,
-        "description": "Modern Facebook main feed structure (2025)"
-      },
-      {
-        "type": "css",
-        "path": "div[data-pagelet='FeedUnit']",
-        "priority": 2,
-        "description": "FeedUnit containers - most reliable"
-      },
-      {
-        "type": "css", 
         "path": "div[aria-posinset]",
-        "priority": 3,
-        "description": "Any element with position info (legacy)"
+        "priority": 1,
+        "description": "✅ Position info - MAIN POSTS ONLY"
       },
       {
         "type": "css",
-        "path": "div[role='article']",
-        "priority": 4,
-        "description": "Article role elements"
-      },
-      {
-        "type": "css",
-        "path": "div[data-testid='story-subtitle'] > div",
-        "priority": 5,
-        "description": "Story containers with subtitles"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[contains(@style, 'transform')]//div[contains(.,'ago') or contains(.,'phút') or contains(.,'giờ') or contains(.,'ngày')]/..",
-        "priority": 6,
-        "description": "Posts with timestamp indicators"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@role='feed']//div[contains(@class, 'post') or contains(@data-pagelet, 'FeedUnit')]",
-        "priority": 7,
-        "description": "XPath fallback for feed posts (legacy)"
+        "path": "div[role='article'][aria-posinset]",
+        "priority": 2,
+        "description": "✅ Article with position - MAIN POSTS ONLY"
       }
     ],
     "validation": {
@@ -60,99 +30,9 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": "//div[@aria-label[contains(., 'Thích: ') and contains(., 'người')]]",
+        "path": ".//div[contains(text(), 'All reactions:')]/parent::*//span[string-length(normalize-space(text())) > 0 and string-length(normalize-space(text())) < 10 and translate(normalize-space(text()), '0123456789,.KM', '') = '']",
         "priority": 1,
-        "description": "🎯 NEW: Direct aria-label match 'Thích: X người' - Sept 29, 2025"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@role='button'][@aria-label[contains(., 'Thích: ') and contains(., 'người')]]",
-        "priority": 2,
-        "description": "🎯 NEW: Button with aria-label 'Thích: X người' - Sept 29, 2025"
-      },
-      {
-        "type": "xpath",
-        "path": "//span[@aria-label[contains(., 'cảm xúc')]]//following-sibling::div//span[contains(@class, 'xt0b8zv')]",
-        "priority": 3,
-        "description": "🎯 NEW: Total reactions number after emotion toolbar - Sept 29, 2025"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[contains(text(), 'Tất cả cảm xúc:')]",
-        "priority": 4,
-        "description": "🎯 NEW: Vietnamese 'Tất cả cảm xúc:X' text - Sept 29, 2025"
-      },
-      {
-        "type": "xpath", 
-        "path": "//*[contains(text(), 'All reactions:')]/ancestor::*[contains(text(), 'All reactions:') and contains(text(), 'Like')][1]",
-        "priority": 5,
-        "description": "🎯 TOTAL REACTIONS: Parent element containing both 'All reactions:X' and 'Like' - Sept 27, 2025"
-      },
-      {
-        "type": "xpath",
-        "path": "//*[contains(text(), 'All reactions:')]/parent::*[contains(text(), 'All reactions:')]",
-        "priority": 2,
-        "description": "🎯 TOTAL REACTIONS: Parent of 'All reactions:' label containing full text - Sept 27, 2025"
-      },
-      {
-        "type": "xpath", 
-        "path": "//span[contains(@aria-label, 'cảm xúc')]/parent::*//*[contains(text(), 'Tất cả cảm xúc:') and contains(text(), ':')]",
-        "priority": 3,
-        "description": "🟢 FALLBACK: Parent containing 'Tất cả cảm xúc:X' with colon - VERIFIED Sept 2025"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@role='button'][@aria-label[contains(., 'Like: ') and contains(., 'people')]]",
-        "priority": 4,
-        "description": "Button with aria-label 'Like: X people' - VERIFIED WORKING (Sept 2025)"
-      },
-      {
-        "type": "xpath",
-        "path": "//*[contains(text(), 'All reactions:') and contains(text(), 'comments')]",
-        "priority": 5,
-        "description": "Element containing both 'All reactions:X' and 'comments' (WORKING PATTERN)"
-      },
-      {
-        "type": "xpath", 
-        "path": "//*[contains(text(), 'reactions:') and string-length(normalize-space(text())) > 15]",
-        "priority": 6,
-        "description": "Element with reactions: and substantial text content"
-      },
-      {
-        "type": "css",
-        "path": "div[role='button']:has-text('Tất cả cảm xúc')",
-        "priority": 7,
-        "description": "Button with total reaction text (Vietnamese)"
-      },
-      {
-        "type": "css",
-        "path": "div[role='button'][aria-label*='All reactions']", 
-        "priority": 8,
-        "description": "English reactions button"
-      },
-      {
-        "type": "xpath",
-        "path": "//span[contains(@aria-label, 'cảm xúc')]/following-sibling::div//span[contains(@class, 'xt0b8zv')]",
-        "priority": 9,
-        "description": "Total reaction count number based on toolbar structure"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@role='button'][contains(@aria-label, 'Like') or contains(@aria-label, 'reaction')]",
-        "priority": 10,
-        "description": "XPath for reaction buttons"
-      },
-      {
-        "type": "xpath",
-        "path": "//span[contains(text(), 'Like') or contains(text(), 'Thích')]/ancestor::div[@role='button']",
-        "priority": 11,
-        "description": "Text-based fallback for like buttons (LIKE ONLY)"
-      },
-      {
-        "type": "css",
-        "path": "span[aria-label*='cảm xúc']",
-        "priority": 12,
-        "description": "Legacy selector - span with reaction label"
+        "description": "✅ WORKING 100%: Total reactions count (English)"
       }
     ],
     "validation": {
@@ -166,39 +46,15 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": "//div[@role='button']//span[contains(text(), 'Bình luận') and not(ancestor::div[contains(@style, 'transform')])]",
+        "path": ".//span[contains(text(), 'comment')]",
         "priority": 1,
-        "description": "Specific comment button text (Vietnamese) - targeted approach"
+        "description": "✅ WORKING: English '11 comments'"
       },
       {
         "type": "xpath",
-        "path": "//div[@role='button']//span[contains(text(), 'Comment') and not(ancestor::div[contains(@style, 'transform')])]",
+        "path": ".//div[@role='button']//span[contains(text(), 'Comment')]",
         "priority": 2,
-        "description": "Specific comment button text (English) - targeted approach"
-      },
-      {
-        "type": "xpath",
-        "path": "//span[contains(text(), 'comment') or contains(text(), 'bình luận')]/ancestor::div[@role='button']",
-        "priority": 3,
-        "description": "Text-based comment button finder (fallback)"
-      },
-      {
-        "type": "xpath", 
-        "path": "//div[@role='button'][@aria-label[contains(., 'comment') or contains(., 'bình luận')]]",
-        "priority": 4,
-        "description": "Comment buttons with accessible labels"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@aria-expanded='true']//span[1]",
-        "priority": 5,
-        "description": "Comment count from expanded comment section"
-      },
-      {
-        "type": "xpath",
-        "path": "//*[contains(text(), 'comments') and string-length(normalize-space(text())) < 50]",
-        "priority": 6,
-        "description": "Short text elements with 'comments'"
+        "description": "✅ WORKING: Comment button (fallback for 0 comments)"
       }
     ],
     "validation": {
@@ -212,21 +68,9 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": "//div[@aria-expanded='true']/following-sibling::div[1]//span[1]",
+        "path": ".//span[contains(text(), 'share')]",
         "priority": 1,
-        "description": "Share count based on position relative to comment count"
-      },
-      {
-        "type": "css",
-        "path": "div[role='button']:has-text('share')",
-        "priority": 2,
-        "description": "Share button with text (English)"
-      },
-      {
-        "type": "css",
-        "path": "div[role='button']:has-text('chia sẻ')",
-        "priority": 3,
-        "description": "Share button with text (Vietnamese)"
+        "description": "✅ English '18 shares'"
       }
     ],
     "validation": {
@@ -242,31 +86,7 @@
         "type": "xpath",
         "path": "//span[string-length(normalize-space(text())) > 20 and not(contains(text(), 'Like')) and not(contains(text(), 'Comment'))]",
         "priority": 1,
-        "description": "🟢 WORKING: Content spans (fallback for different post types) - VERIFIED Sept 2025"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@role='article']//div[string-length(normalize-space(text())) > 15]",
-        "priority": 2,
-        "description": "Content-rich divs - VERIFIED WORKING (Sept 2025)"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[string-length(normalize-space(text())) > 30 and not(contains(text(), 'ago')) and not(contains(text(), 'Like')) and not(contains(text(), 'Share'))]",
-        "priority": 3,
-        "description": "Flexible content detection - VERIFIED WORKING (Sept 2025)"
-      },
-      {
-        "type": "css",
-        "path": "div[data-ad-preview='message']",
-        "priority": 4,
-        "description": "Primary message container (OUTDATED - FB changed structure)"
-      },
-      {
-        "type": "css",
-        "path": "div[data-testid='post_message']",
-        "priority": 5,
-        "description": "Test ID based message container"
+        "description": "✅ WORKING: Content spans"
       }
     ],
     "validation": {
@@ -281,37 +101,19 @@
         "type": "css",
         "path": "strong",
         "priority": 1,
-        "description": "Simple strong text (author name)"
+        "description": "✅ WORKING: Strong text"
       },
       {
         "type": "css",
         "path": "h3",
         "priority": 2,
-        "description": "H3 heading content (author name)"
+        "description": "✅ WORKING: H3 heading"
       },
       {
         "type": "css",
         "path": "h1, h2, h3, h4, h5, h6",
         "priority": 3,
-        "description": "Any heading element (author name)"
-      },
-      {
-        "type": "css",
-        "path": "a strong",
-        "priority": 4,
-        "description": "Strong text within link (author name)"
-      },
-      {
-        "type": "css",
-        "path": "[role='link'] strong",
-        "priority": 5,
-        "description": "Strong text in link role element"
-      },
-      {
-        "type": "xpath",
-        "path": "//strong[string-length(normalize-space(text())) > 1 and string-length(normalize-space(text())) < 100]",
-        "priority": 6,
-        "description": "XPath for any strong text with reasonable length"
+        "description": "✅ WORKING: Any heading"
       }
     ],
     "validation": {
@@ -327,43 +129,7 @@
         "type": "css",
         "path": "a[role='link'][href*='/posts/']",
         "priority": 1,
-        "description": "Direct post links"
-      },
-      {
-        "type": "css",
-        "path": "a[role='link'][href*='/photo/']",
-        "priority": 2,
-        "description": "Photo post links"
-      },
-      {
-        "type": "css",
-        "path": "a[role='link'][href*='/videos/']",
-        "priority": 3,
-        "description": "Video post links"
-      },
-      {
-        "type": "css",
-        "path": "a[aria-label*='thời gian']",
-        "priority": 4,
-        "description": "Timestamp links (Vietnamese)"
-      },
-      {
-        "type": "css",
-        "path": "a[role='link'][aria-label*='ago']",
-        "priority": 5,
-        "description": "Timestamp links (English)"
-      },
-      {
-        "type": "xpath",
-        "path": "//a[@role='link'][contains(@href, '/posts/') or contains(@href, '/photo/') or contains(@href, '/videos/')]",
-        "priority": 6,
-        "description": "XPath for any post-related links"
-      },
-      {
-        "type": "css",
-        "path": "a[href*='?story_fbid']",
-        "priority": 7,
-        "description": "Legacy selector - story fbid links"
+        "description": "✅ WORKING: Direct post links"
       }
     ],
     "validation": {
@@ -378,25 +144,7 @@
         "type": "css",
         "path": "a[href*='/user/']",
         "priority": 1,
-        "description": "User profile links"
-      },
-      {
-        "type": "css",
-        "path": "a[href*='facebook.com/profile.php']",
-        "priority": 2,
-        "description": "Profile.php links"
-      },
-      {
-        "type": "xpath",
-        "path": "//a[contains(@href, '/user/') or contains(@href, '/profile.php')]",
-        "priority": 3,
-        "description": "XPath for profile links"
-      },
-      {
-        "type": "css",
-        "path": "strong a[href*='facebook.com/']",
-        "priority": 4,
-        "description": "Strong text with Facebook links"
+        "description": "✅ WORKING: User profile links"
       }
     ],
     "validation": {
@@ -411,92 +159,13 @@
         "type": "css",
         "path": "div[role='button']:has-text('See more')",
         "priority": 1,
-        "description": "See more buttons (English)"
-      },
-      {
-        "type": "css",
-        "path": "div[role='button']:has-text('Xem thêm')",
-        "priority": 2,
-        "description": "See more buttons (Vietnamese)"
-      },
-      {
-        "type": "xpath",
-        "path": "//div[@role='button'][contains(text(), 'See more') or contains(text(), 'Xem thêm')]",
-        "priority": 3,
-        "description": "XPath for expand buttons"
-      },
-      {
-        "type": "css",
-        "path": "span:has-text('See more')",
-        "priority": 4,
-        "description": "Span elements with expand text"
+        "description": "✅ WORKING: See more buttons"
       }
     ],
     "validation": {
       "type": "elements_found",
       "required": false,
       "min_count": 0
-    }
-  },
-  "reaction_details": {
-    "modal_trigger": {
-      "return_type": "element",
-      "strategies": [
-        {
-          "type": "xpath",
-          "path": ".//span[@role='toolbar' and contains(@aria-label, 'cảm xúc')]/following-sibling::div//div[@role='button']",
-          "priority": 1,
-          "description": "Total reaction count button (structure-based, Vietnamese)"
-        },
-        {
-          "type": "xpath",
-          "path": ".//span[@role='toolbar' and contains(@aria-label, 'reactions')]/following-sibling::div//div[@role='button']",
-          "priority": 2,
-          "description": "Total reaction count button (structure-based, English)"
-        },
-        {
-          "type": "css",
-          "path": "div[role='button']:has-text('Tất cả cảm xúc')",
-          "priority": 3,
-          "description": "Button with total reaction text (Vietnamese)"
-        },
-        {
-          "type": "css",
-          "path": "div[role='button']:has-text('All reactions')",
-          "priority": 4,
-          "description": "Button with total reaction text (English)"
-        }
-      ],
-      "validation": { "type": "element_found", "required": true }
-    },
-    "modal_container": {
-      "return_type": "element",
-      "strategies": [
-        {
-          "type": "xpath",
-          "path": "//div[@role='dialog'][.//div[@role='tab']]",
-          "priority": 1,
-          "description": "Any dialog that contains reaction tabs"
-        },
-        {
-          "type": "css",
-          "path": "div[role='dialog']:has(div[role='tab'])",
-          "priority": 2,
-          "description": "CSS equivalent for a dialog containing tabs"
-        }
-      ],
-      "validation": { "type": "element_found", "required": true }
-    },
-    "reaction_tab": {
-        "strategies": [
-        {
-          "type": "xpath",
-          "path": "//div[@role='dialog']//div[@role='tab' and contains(@aria-label, '{REACTION_TYPE}')]",
-          "priority": 1,
-          "description": "Tab for a specific reaction type, e.g., 'Like'"
-        }
-      ],
-      "validation": { "type": "element_found", "required": true }
     }
   }
 }

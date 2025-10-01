@@ -51,8 +51,54 @@ try:
 except ImportError:
     settings = FallbackSettings()
 
+# Auto-detect worker concurrency from available sessions
+def get_worker_concurrency():
+    """
+    Auto-detect optimal worker concurrency based on available sessions.
+    
+    Returns:
+        int: Number of concurrent workers (defaults to 2 if detection fails)
+    """
+    import json
+    import os
+    
+    try:
+        # Try to get from environment variable first (highest priority)
+        env_concurrency = os.environ.get('WORKER_CONCURRENCY')
+        if env_concurrency:
+            concurrency = int(env_concurrency)
+            print(f"🔧 Using WORKER_CONCURRENCY from env: {concurrency}")
+            return concurrency
+        
+        # Try to get from config
+        if hasattr(settings, 'worker') and settings.worker.concurrency > 0:
+            print(f"🔧 Using concurrency from config: {settings.worker.concurrency}")
+            return settings.worker.concurrency
+        
+        # Auto-detect from session_status.json
+        session_file = 'session_status.json'
+        if os.path.exists(session_file):
+            with open(session_file, 'r') as f:
+                sessions = json.load(f)
+                ready_sessions = sum(1 for s in sessions.values() if s.get('status') == 'READY')
+                if ready_sessions > 0:
+                    print(f"🔧 Auto-detected {ready_sessions} READY sessions, setting concurrency={ready_sessions}")
+                    return ready_sessions
+        
+        print(f"⚠️ session_status.json not found, using default concurrency=2")
+            
+    except Exception as e:
+        print(f"⚠️ Failed to auto-detect concurrency: {e}")
+    
+    # Default fallback
+    print("🔧 Using default concurrency=2")
+    return 2
+
 # CELERY APPLICATION SETUP
 app = Celery('facebook_scraper')
+
+# Get dynamic worker concurrency
+WORKER_CONCURRENCY = get_worker_concurrency()
 
 # Celery configuration
 app.conf.update(
@@ -73,7 +119,7 @@ app.conf.update(
     # Worker configuration
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=1000,
-    worker_concurrency=2,
+    worker_concurrency=WORKER_CONCURRENCY,  # Auto-detected from sessions
 
     # Task configuration
     task_acks_late=True,
@@ -265,6 +311,30 @@ class SafeBrowserManager:
                     logger.info("✅ Browser context closed")
                 except Exception as e:
                     cleanup_errors.append(f"Context close error: {e}")
+            
+            # 1.5. ✅ FIX: CRITICAL - Remove SingletonLock files immediately after browser close
+            if session_name:
+                try:
+                    import os
+                    import glob
+                    session_dir = f"sessions/{session_name}"
+                    lock_patterns = [
+                        f"{session_dir}/SingletonLock",
+                        f"{session_dir}/SingletonCookie",
+                        f"{session_dir}/SingletonSocket",
+                        f"{session_dir}/.lock",
+                        f"{session_dir}/lockfile"
+                    ]
+                    for pattern in lock_patterns:
+                        for lock_file in glob.glob(pattern):
+                            try:
+                                os.remove(lock_file)
+                                logger.debug(f"🧹 Removed lock file: {lock_file}")
+                            except Exception as e:
+                                logger.debug(f"⚠️ Could not remove {lock_file}: {e}")
+                    logger.info(f"✅ Lock files cleaned for session: {session_name}")
+                except Exception as e:
+                    cleanup_errors.append(f"Lock file cleanup error: {e}")
             
             # 2. Stop playwright
             if playwright:

@@ -267,63 +267,124 @@ class ScraperCoordinator:
                 logger.critical(f"🚨 CAPTCHA detected on URL: {url}")
                 raise CaptchaException(f"CAPTCHA detected on {url}", "navigation")
             
-            # Scroll to the bottom of the feed to load posts (with limits)
-            post_elements = await self._scroll_to_bottom_of_feed(max_posts, max_scroll_time)
+            # 🚀 BATCH PROCESSING: Scroll + Extract incrementally
+            results = await self._scroll_and_process_batches(url, scrape_since_date, max_posts, max_scroll_time)
             
-            if not post_elements:
-                logger.warning("⚠️ Không tìm thấy post elements nào")
-                return {
-                    "new_posts": 0,
-                    "interactions_logged": 0, 
-                    "errors": 0,
-                    "reason": "No posts found"
-                }
+            logger.info(f"✅ Hoàn thành xử lý URL: {results}")
+            return results
             
-            logger.info(f"📊 Tìm thấy {len(post_elements)} post elements")
+        except CaptchaException as e:
+            logger.critical(f"🚨 CAPTCHA detected during processing URL {url}: {e}")
+            # Re-raise CAPTCHA exception for higher-level handling
+            raise
+        except Exception as e:
+            logger.error(f"💥 Critical error processing URL {url}: {type(e).__name__}: {e}", exc_info=True)
+            return {"new_posts": 0, "interactions_logged": 0, "errors": 1, "reason": f"{type(e).__name__}: {str(e)}"}
+
+    async def _scroll_and_process_batches(self, url: str, scrape_since_date: date, max_posts: int, max_scroll_time: int) -> Dict[str, Any]:
+        """
+        🚀 BATCH PROCESSING: Scroll + Extract incrementally instead of waiting for all scrolling to finish
+        
+        This method combines scrolling and extraction:
+        1. Scroll to find new posts
+        2. Extract and save those posts IMMEDIATELY
+        3. Continue scrolling
+        4. Repeat until done
+        
+        Benefits:
+        - ✅ Get data immediately, no waiting
+        - ✅ Avoid stale elements (elements don't get old)
+        - ✅ Lower memory usage (don't hold 400+ elements)
+        - ✅ Better performance
+        """
+        import time
+        
+        start_time = time.time()
+        results = {"new_posts": 0, "interactions_logged": 0, "errors": 0}
+        
+        # Track processed posts to avoid duplicates
+        processed_post_signatures = set()
+        processed_count = 0
+        total_posts_found = 0
+        
+        stale_scrolls = 0
+        total_scrolls = 0
+        should_stop = False  # Flag for date-based stopping
+        
+        logger.info(f"🚀 BATCH PROCESSING MODE: Extract while scrolling!")
+        logger.info(f"📊 Limits: max_posts={max_posts:,}, max_time={max_scroll_time/3600:.1f}h")
+        logger.info(f"📅 Will stop when finding posts older than {scrape_since_date}")
+        
+        # Initial load
+        post_elements = await self.navigation_handler.find_post_elements(self.content_extractor)
+        total_posts_found = len(post_elements)
+        logger.info(f"📍 Initial load: {total_posts_found} posts found")
+        
+        while not should_stop and stale_scrolls < 3:
+            # Check safety limits
+            elapsed_time = time.time() - start_time
+            if elapsed_time > max_scroll_time:
+                logger.warning(f"⏰ SAFETY: Time limit reached. Stopping.")
+                break
             
-            # Process posts using Hybrid Logic
-            results = {"new_posts": 0, "interactions_logged": 0, "errors": 0}
+            if processed_count >= max_posts:
+                logger.warning(f"📊 SAFETY: Processed {processed_count} posts. Stopping.")
+                break
             
-            for i, post_element in enumerate(post_elements):  # REMOVED limit to 20 posts
+            # 🎯 PROCESS CURRENT BATCH
+            new_posts_in_batch = []
+            for post_element in post_elements:
                 try:
-                    logger.debug(f"🔄 Xử lý post {i+1}/{len(post_elements)}")
+                    # Quick signature check to avoid reprocessing
+                    post_html_snippet = (await post_element.inner_html())[:200]
+                    quick_sig = str(hash(post_html_snippet))
                     
-                    # ===== TIME-BASED FILTERING =====
-                    # Lấy chuỗi thời gian từ post element
+                    if quick_sig in processed_post_signatures:
+                        continue  # Already processed
+                    
+                    processed_post_signatures.add(quick_sig)
+                    new_posts_in_batch.append(post_element)
+                    
+                except Exception as e:
+                    logger.debug(f"Skip post due to error getting signature: {e}")
+                    continue
+            
+            logger.info(f"📦 Processing batch: {len(new_posts_in_batch)} new posts")
+            
+            # Extract each post in this batch
+            for i, post_element in enumerate(new_posts_in_batch):
+                try:
+                    processed_count += 1
+                    
+                    # TIME-BASED FILTERING
                     try:
                         time_string = await self._extract_post_time(post_element)
                         if time_string:
                             post_datetime = self._parse_facebook_timestamp(time_string)
-
-                            # THÊM KHỐI KIỂM TRA NÀY
+                            
                             if post_datetime is None:
-                                logger.warning(f"Bỏ qua bài viết vì không phân tích được thời gian: '{time_string}'")
-                                continue # Chuyển sang bài viết tiếp theo
-
-                            if post_datetime.date() < scrape_since_date:
-                                logger.info(f"📅 Bài viết quá cũ ({post_datetime.date()}), dừng quét trang này")
-                                break  # Dừng lại vì các bài sau cũng sẽ cũ hơn
-                        else:
-                            logger.debug(f"⚠️ Không lấy được thời gian của bài viết {i+1}, tiếp tục xử lý")
+                                logger.debug(f"Cannot parse time: '{time_string}', continuing")
+                            elif post_datetime.date() < scrape_since_date:
+                                logger.info(f"📅 Found old post ({post_datetime.date()}), stopping extraction")
+                                should_stop = True
+                                break
                     except Exception as e:
-                        logger.warning(f"⚠️ Lỗi kiểm tra thời gian bài viết {i+1}: {e}, tiếp tục xử lý")
+                        logger.debug(f"Error checking post time: {e}")
                     
-                    # ===== FAST STREAM - ALWAYS RUN =====
+                    # FAST STREAM - Extract interactions
                     interaction_result = await self._process_fast_stream(post_element, url)
                     
                     if interaction_result["success"]:
                         results["interactions_logged"] += 1
                         
-                        # 🔧 PRODUCTION FIX: Atomic dual-stream processing for new posts
+                        # Atomic dual-stream for new posts
                         if interaction_result["is_new_post"]:
-                            logger.info("✨ Phát hiện post mới, bắt đầu atomic dual-stream processing...")
+                            logger.info(f"✨ New post detected ({processed_count}/{total_posts_found})")
                             
-                            # Expand and get detailed post information
                             await self.navigation_handler.expand_post_content(post_element, self.content_extractor)
                             post_details = await self._extract_post_details(post_element)
                             
                             if post_details:
-                                # Use atomic operation to ensure data consistency
                                 atomic_success = self.db_manager.add_new_post_with_interaction(
                                     post_signature=interaction_result['post_signature'],
                                     post_url=post_details.get('post_url', ''),
@@ -337,40 +398,45 @@ class ScraperCoordinator:
                                 
                                 if atomic_success:
                                     results["new_posts"] += 1
-                                    # Don't count interaction separately since it's included in atomic operation
-                                    results["interactions_logged"] -= 1  # Adjust count
-                                    logger.info(
-                                        f"🎯 Atomic dual-stream success for post: "
-                                        f"{interaction_result['post_signature'][:30]}..."
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"⚠️ Atomic dual-stream failed for: "
-                                        f"{interaction_result['post_signature'][:30]}..."
-                                    )
-                            else:
-                                logger.warning("⚠️ Could not extract post details for atomic operation")
+                                    results["interactions_logged"] -= 1
+                                    logger.info(f"🎯 Saved post {processed_count}: {interaction_result['post_signature'][:30]}...")
                     else:
                         results["errors"] += 1
                     
-                    # Humanized delay and random interactions between posts
-                    await self.interaction_simulator.humanized_delay_between_posts(i, len(post_elements))
-                    
+                    # Small delay between posts
+                    if i < len(new_posts_in_batch) - 1:  # Not last post
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                        
                 except Exception as e:
-                    logger.error(f"❌ Error processing post {i+1}/{len(post_elements)}: {e}", exc_info=False)
+                    logger.error(f"❌ Error processing post {processed_count}: {e}")
                     results["errors"] += 1
                     continue
             
-            logger.info(f"✅ Hoàn thành xử lý URL: {results}")
-            return results
+            if should_stop:
+                logger.info("🛑 Stopping due to date limit reached")
+                break
             
-        except CaptchaException as e:
-            logger.critical(f"🚨 CAPTCHA detected during processing URL {url}: {e}")
-            # Re-raise CAPTCHA exception for higher-level handling
-            raise
-        except Exception as e:
-            logger.error(f"💥 Critical error processing URL {url}: {type(e).__name__}: {e}", exc_info=True)
-            return {"new_posts": 0, "interactions_logged": 0, "errors": 1, "reason": f"{type(e).__name__}: {str(e)}"}
+            # 📜 SCROLL FOR MORE POSTS
+            last_count = total_posts_found
+            await self.navigation_handler.humanized_scroll_page()
+            total_scrolls += 1
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            
+            post_elements = await self.navigation_handler.find_post_elements(self.content_extractor)
+            total_posts_found = len(post_elements)
+            
+            if total_posts_found > last_count:
+                stale_scrolls = 0
+                new_count = total_posts_found - last_count
+                logger.info(f"📜 Scroll #{total_scrolls}: Found {new_count} more posts (total: {total_posts_found})")
+            else:
+                stale_scrolls += 1
+                logger.info(f"📜 Scroll #{total_scrolls}: No new posts (attempt {stale_scrolls}/3)")
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Batch processing done: {processed_count} posts processed in {elapsed:.1f}s ({total_scrolls} scrolls)")
+        
+        return results
 
     async def _scroll_to_bottom_of_feed(self, max_posts: Optional[int] = None, max_scroll_time: Optional[int] = None) -> List[Any]:
         """

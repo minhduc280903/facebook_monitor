@@ -320,7 +320,7 @@ def main():
                         height=500
                     )
                     
-                    st.plotly_chart(fig_cumulative, use_container_width=True)
+                    st.plotly_chart(fig_cumulative, width='stretch')
                 
                 with tab2:
                     st.markdown("**Biểu đồ delta** - Thay đổi likes và comments giữa các lần đo")
@@ -356,7 +356,7 @@ def main():
                             height=500
                         )
                         
-                        st.plotly_chart(fig_delta, use_container_width=True)
+                        st.plotly_chart(fig_delta, width='stretch')
                     else:
                         st.info("Không có dữ liệu delta để hiển thị")
                 
@@ -369,7 +369,7 @@ def main():
                         st.write("**📈 Cumulative Data:**")
                         st.dataframe(
                             cumulative_df,
-                            use_container_width=True,
+                            width='stretch',
                             column_config={
                                 "timestamp": st.column_config.DatetimeColumn("Time"),
                                 "likes": st.column_config.NumberColumn("Likes", format="%d"),
@@ -382,7 +382,7 @@ def main():
                             st.write("**📊 Delta Data:**")
                             st.dataframe(
                                 delta_df[delta_df[['likes_delta', 'comments_delta']].sum(axis=1) > 0],  # Only show rows with changes
-                                use_container_width=True,
+                                width='stretch',
                                 column_config={
                                     "timestamp": st.column_config.DatetimeColumn("Time"),
                                     "likes_delta": st.column_config.NumberColumn("Likes Δ", format="%d"),

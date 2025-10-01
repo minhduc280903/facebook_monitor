@@ -342,7 +342,7 @@ def main():
                 alerts_df = pd.DataFrame(active_alerts)
                 st.dataframe(
                     alerts_df,
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     column_config={
                         "selector": st.column_config.TextColumn("Broken Selector", width="large"),
@@ -367,7 +367,7 @@ def main():
                     healed_df = pd.DataFrame(healed_alerts)
                     st.dataframe(
                         healed_df,
-                        use_container_width=True,
+                        width='stretch',
                         hide_index=True,
                         column_config={
                             "selector": st.column_config.TextColumn("Healed Selector", width="large"),
@@ -473,7 +473,7 @@ def main():
         # Display table with selection
         st.dataframe(
             final_df,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Nội dung": st.column_config.TextColumn(width="large"),
@@ -526,7 +526,7 @@ def main():
                 labels={'source_display': 'Source', 'viral_score': 'Total Viral Score'}
             )
             fig_sources.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_sources, use_container_width=True, config=get_mobile_plotly_config())
+            st.plotly_chart(fig_sources, width='stretch', config=get_mobile_plotly_config())
         
         with col2:
             # Engagement distribution
@@ -551,7 +551,7 @@ def main():
                 xaxis_title="Likes",
                 yaxis_title="Comments"
             )
-            st.plotly_chart(fig_engagement, use_container_width=True, config=get_mobile_plotly_config())
+            st.plotly_chart(fig_engagement, width='stretch', config=get_mobile_plotly_config())
     
 
 if __name__ == "__main__":

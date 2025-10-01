@@ -616,7 +616,7 @@ class ProxyManager:
             for endpoint in test_endpoints:
                 try:
                     start_time = time.time()
-                    response = session.get(endpoint, timeout=10, allow_redirects=False)
+                    response = session.get(endpoint, timeout=5, allow_redirects=False)
                     response_time = time.time() - start_time
                     
                     # Update response time in metadata
@@ -678,7 +678,7 @@ class ProxyManager:
             ]
             
             start_time = time.time()
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=5)
             
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 # Try each endpoint
@@ -948,6 +948,62 @@ class ProxyManager:
             return released_count
 
 
+    def get_healthy_proxy_ids(self, force_check: bool = False) -> List[str]:
+        """
+        ✅ FIX #3: Get list of healthy proxy IDs with optional health check
+        
+        This method pre-validates proxies before checkout to avoid wasting resources
+        on failed proxies.
+        
+        Args:
+            force_check: If True, run health check even if recently verified
+            
+        Returns:
+            List of proxy IDs that are healthy and available
+        """
+        healthy_proxy_ids = []
+        
+        with self.lock:
+            for proxy_id, proxy_resource in self.resource_pool.items():
+                # Skip quarantined or disabled
+                if proxy_resource.is_quarantined() or proxy_resource.status in ["DISABLED", "TESTING"]:
+                    logger.debug(f"⚠️ Proxy {proxy_id} skipped - quarantined or disabled")
+                    continue
+                
+                # Validate config exists
+                proxy_config = proxy_resource.metadata.get("config")
+                if not proxy_config or not self._validate_proxy_config(proxy_config):
+                    logger.debug(f"⚠️ Proxy {proxy_id} skipped - invalid config")
+                    continue
+                
+                # Check if recently verified (within 5 minutes) unless force_check
+                if not force_check:
+                    last_checked = proxy_resource.metadata.get("last_checked")
+                    if last_checked:
+                        try:
+                            last_check_time = datetime.fromisoformat(last_checked)
+                            if datetime.now() - last_check_time < timedelta(minutes=5):
+                                healthy_proxy_ids.append(proxy_id)
+                                logger.debug(f"✅ Proxy {proxy_id} recently verified (cached)")
+                                continue
+                        except Exception as e:
+                            logger.debug(f"Failed to parse last_checked for {proxy_id}: {e}")
+                
+                # Run health check
+                proxy_config_copy = proxy_config.copy()
+                proxy_config_copy["proxy_id"] = proxy_id
+                
+                if self.health_check_proxy(proxy_config_copy):
+                    # Update last_checked timestamp to cache result
+                    proxy_resource.metadata["last_checked"] = datetime.now().isoformat()
+                    healthy_proxy_ids.append(proxy_id)
+                    logger.debug(f"✅ Proxy {proxy_id} verified healthy")
+                else:
+                    logger.warning(f"⚠️ Proxy {proxy_id} failed health check")
+        
+        logger.info(f"📊 Found {len(healthy_proxy_ids)} healthy proxies out of {len(self.resource_pool)} total")
+        return healthy_proxy_ids
+    
     def reload_proxies_from_file(self):
         """
         🔄 Reload proxies from file và update resource pool

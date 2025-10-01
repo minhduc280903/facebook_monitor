@@ -1,6 +1,12 @@
 # Sử dụng một base image Python nhẹ
 FROM python:3.11-slim
 
+# 🌍 FIX ENCODING: Set UTF-8 locale
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8 \
+    PYTHONUNBUFFERED=1
+
 # Thiết lập thư mục làm việc bên trong container
 WORKDIR /app
 
@@ -9,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
     curl \
+    locales \
     fonts-unifont \
     fonts-liberation \
     libgobject-2.0-0 \
@@ -36,7 +43,9 @@ RUN apt-get update && apt-get install -y \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
+    && locale-gen en_US.UTF-8
 
 # Cài đặt các dependencies trước để tận dụng Docker layer caching
 # Copy unified requirements file (Phase 3.2: consolidated all dependencies into one file)
@@ -44,7 +53,8 @@ COPY requirements.txt .
 # Increase timeout to 300s for slow networks
 RUN pip install --no-cache-dir --timeout=300 -r requirements.txt
 
-# Download browser binaries for Playwright (without deps to avoid font conflicts)
+# Download browser binaries for Playwright
+# NOTE: Using chromium only (deps already installed via apt-get above)
 RUN playwright install chromium
 
 # Copy toàn bộ code của dự án vào container
