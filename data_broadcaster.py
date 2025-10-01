@@ -477,6 +477,22 @@ class DataBroadcaster:
                 self.db_manager.close()
             logger.info("👋 Data broadcaster đã thoát")
 
+    def close(self) -> None:
+        """✅ FIX: Cleanup database and PostgreSQL LISTEN connection (sync version)."""
+        try:
+            if self.listen_connection and not self.listen_connection.closed:
+                self.listen_connection.close()
+                logger.info("🔒 LISTEN connection closed")
+            if self.db_manager:
+                self.db_manager.close()
+                logger.info("🔒 DatabaseManager closed")
+        except Exception as e:
+            logger.error(f"❌ Error during cleanup: {e}")
+
+    def __del__(self) -> None:
+        """✅ FIX: Destructor to ensure cleanup on object deletion."""
+        self.close()
+
 
 import sys
 import io

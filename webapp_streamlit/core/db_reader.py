@@ -355,11 +355,11 @@ class DatabaseReader:
             params_tuple = tuple(params) if params else None
             df = self._execute_pandas_query(query, params_tuple)
 
-            # Format datetime columns
+            # Format datetime columns with ISO8601 support
             if not df.empty and 'first_seen_utc' in df.columns:
-                df['first_seen_utc'] = pd.to_datetime(df['first_seen_utc'], errors='coerce')
+                df['first_seen_utc'] = pd.to_datetime(df['first_seen_utc'], format='ISO8601', errors='coerce')
             if not df.empty and 'latest_time' in df.columns:
-                df['latest_time'] = pd.to_datetime(df['latest_time'], errors='coerce')
+                df['latest_time'] = pd.to_datetime(df['latest_time'], format='ISO8601', errors='coerce')
 
             # Quality filter (optional)
             if not df.empty and apply_quality_filter:
@@ -458,8 +458,8 @@ class DatabaseReader:
                 logger.warning(f"⚠️ Không tìm thấy data cho post: {post_signature[:20]}...")
                 return {'cumulative': pd.DataFrame(), 'delta': pd.DataFrame()}
 
-            # Convert timestamp to datetime
-            df['timestamp'] = pd.to_datetime(df['log_timestamp_utc'])
+            # Convert timestamp to datetime with ISO8601 format support
+            df['timestamp'] = pd.to_datetime(df['log_timestamp_utc'], format='ISO8601')
 
             # Cumulative data
             cumulative_df = df[['timestamp', 'like_count', 'comment_count']].copy()
@@ -574,7 +574,7 @@ class DatabaseReader:
             df = self._execute_pandas_query(query, (search_param,))
 
             if not df.empty:
-                df['first_seen_utc'] = pd.to_datetime(df['first_seen_utc'])
+                df['first_seen_utc'] = pd.to_datetime(df['first_seen_utc'], format='ISO8601')
                 df['source_name'] = df['source_url'].apply(self.get_friendly_source_name)
 
             logger.info(f"🔍 Found {len(df)} posts matching '{search_term}'")
@@ -628,8 +628,8 @@ class DatabaseReader:
                 logger.warning("⚠️ Không có dữ liệu interactions cho forex chart")
                 return pd.DataFrame()
 
-            # Convert timestamp to datetime
-            df['timestamp'] = pd.to_datetime(df['log_timestamp_utc'])
+            # Convert timestamp to datetime with ISO8601 format support
+            df['timestamp'] = pd.to_datetime(df['log_timestamp_utc'], format='ISO8601')
             df.set_index('timestamp', inplace=True)
 
             # Resample theo timeframe và tạo OHLC data
@@ -674,6 +674,22 @@ class DatabaseReader:
         except Exception as e:
             logger.error(f"❌ Lỗi generate forex data: {e}")
             return pd.DataFrame()
+
+    def close(self) -> None:
+        """✅ FIX: Cleanup database connections and SQLAlchemy engine."""
+        try:
+            if self.engine:
+                self.engine.dispose()
+                logger.info("🔒 SQLAlchemy engine disposed")
+            if self.db_manager:
+                self.db_manager.close()
+                logger.info("🔒 DatabaseManager closed")
+        except Exception as e:
+            logger.error(f"❌ Error during cleanup: {e}")
+
+    def __del__(self) -> None:
+        """✅ FIX: Destructor to ensure cleanup on object deletion."""
+        self.close()
 
 
 # Singleton instance for use across Streamlit app

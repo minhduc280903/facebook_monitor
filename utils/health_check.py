@@ -267,6 +267,22 @@ class HealthChecker:
         health = self.get_overall_health()
         return "UP" if health["status"] in ["UP", "WARNING"] else "DOWN"
 
+    def close(self) -> None:
+        """✅ FIX: Cleanup database and Redis connections."""
+        try:
+            if self.redis_client:
+                self.redis_client.close()
+                logger.info("🔒 Redis client closed")
+            if self.db_manager:
+                self.db_manager.close()
+                logger.info("🔒 DatabaseManager closed")
+        except Exception as e:
+            logger.error(f"❌ Error during cleanup: {e}")
+
+    def __del__(self) -> None:
+        """✅ FIX: Destructor to ensure cleanup on object deletion."""
+        self.close()
+
 
 # Global health checker instance
 health_checker = HealthChecker()

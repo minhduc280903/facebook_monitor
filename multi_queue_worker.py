@@ -232,6 +232,19 @@ class SafeBrowserManager:
 
             logger.info(f"✅ Browser session ready: {session_name}")
             
+            # 🔐 CRITICAL: Verify login status before allowing scraping
+            is_logged_in = await self._verify_login_status(page, session_name)
+            
+            if not is_logged_in:
+                logger.error(f"❌ Session {session_name} is NOT logged in - marking as NEEDS_LOGIN")
+                self.session_manager.mark_session_invalid(session_name, "Not logged in after browser launch")
+                raise Exception(f"Session {session_name} not logged in - cannot proceed with scraping")
+            
+            logger.info(f"✅ Login verified for session: {session_name}")
+            
+            # 🔥 WARMUP: Random delay + casual browsing để avoid CAPTCHA
+            await self._warmup_session(page, session_name)
+            
             # Yield to caller - guaranteed cleanup in finally block
             yield page, session_name
 
@@ -298,6 +311,92 @@ class SafeBrowserManager:
             else:
                 logger.info("🎉 Browser cleanup completed successfully")
 
+    async def _warmup_session(self, page, session_name: str):
+        """
+        Warm up session với human-like behavior để tránh CAPTCHA
+        
+        Args:
+            page: Playwright page instance
+            session_name: Session name for logging
+        """
+        import random
+        import asyncio
+        
+        try:
+            logger.info(f"🔥 Warming up session {session_name}...")
+            
+            # Random delay 2-5 giây
+            warmup_delay = random.uniform(2, 5)
+            await asyncio.sleep(warmup_delay)
+            
+            # Scroll ngẫu nhiên để mimic human
+            try:
+                scroll_distance = random.randint(300, 800)
+                await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                
+                # Scroll back
+                await page.evaluate("window.scrollBy(0, -200)")
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+            except Exception as e:
+                logger.debug(f"Warmup scroll failed (non-critical): {e}")
+            
+            logger.debug(f"✅ Session warmup completed for {session_name}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Session warmup failed (non-critical): {e}")
+    
+    async def _verify_login_status(self, page, session_name: str) -> bool:
+        """
+        Verify if browser session is logged into Facebook
+        
+        Args:
+            page: Playwright page instance
+            session_name: Session name for logging
+            
+        Returns:
+            True if logged in, False otherwise
+        """
+        try:
+            logger.info(f"🔐 Verifying login status for session: {session_name}")
+            
+            # Navigate to Facebook to check login
+            await page.goto('https://www.facebook.com/', wait_until='domcontentloaded', timeout=30000)
+            await asyncio.sleep(3)  # Wait for page to fully load
+            
+            # Check for logged-in indicators
+            logged_in_selectors = [
+                '[aria-label="Trang chủ"]',      # Home button (Vietnamese)
+                '[aria-label="Home"]',           # Home button (English)
+                'div[role="navigation"]',        # Main navigation bar
+                'div[aria-label="Tài khoản"]',   # Account icon (Vietnamese)
+                'div[aria-label="Account"]',     # Account icon (English)
+                'a[href="/marketplace/"]',       # Marketplace link
+                '[data-testid="search"]'         # Search box
+            ]
+            
+            for selector in logged_in_selectors:
+                try:
+                    element = await page.wait_for_selector(selector, timeout=5000, state='visible')
+                    if element:
+                        logger.info(f"✅ Login verified with selector: {selector}")
+                        return True
+                except Exception:
+                    continue
+            
+            # Check URL - if redirected to login page, not logged in
+            current_url = page.url
+            if 'login' in current_url.lower() or 'checkpoint' in current_url.lower():
+                logger.warning(f"⚠️ Session not logged in - URL: {current_url}")
+                return False
+            
+            logger.warning(f"⚠️ Could not verify login status for session: {session_name}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error verifying login status: {e}")
+            return False
+    
     def _get_session_proxy_pair(self):
         """Get session-proxy pair with error handling"""
         try:
@@ -450,8 +549,31 @@ def scan_facebook_url(self, task_info: dict):
 
     except CaptchaException as e:
         logger.critical(f"🚨 CAPTCHA detected: {e}")
-        # CAPTCHA không retry, pause task
-        raise Exception(f"CAPTCHA detected: {e}")
+        
+        # CRITICAL: Quarantine proxy to prevent further CAPTCHA
+        if 'proxy_config' in task_info and task_info['proxy_config']:
+            proxy_id = task_info['proxy_config'].get('proxy_id')
+            if proxy_id:
+                try:
+                    # Import ProxyManager để quarantine
+                    from core.proxy_manager import ProxyManager
+                    from dependency_injection import DIContainer
+                    
+                    container = DIContainer()
+                    proxy_manager = container.get_proxy_manager()
+                    
+                    # Quarantine proxy for 30 minutes
+                    proxy_manager.mark_proxy_failed(
+                        proxy_id=proxy_id,
+                        reason=f"CAPTCHA detected: {str(e)}",
+                        quarantine_duration_minutes=30
+                    )
+                    logger.warning(f"⚠️ Proxy {proxy_id} quarantined for 30 minutes due to CAPTCHA")
+                except Exception as qe:
+                    logger.error(f"Failed to quarantine proxy: {qe}")
+        
+        # Don't retry CAPTCHA tasks immediately - let proxy cool down
+        raise Exception(f"CAPTCHA detected, proxy quarantined: {e}")
 
     except Exception as exc:
         logger.error(f"❌ Scan failed for {url}: {exc}")
@@ -480,13 +602,10 @@ async def _async_scan_task(task_info: dict):
     - Session-proxy resource leaks
     - Guaranteed cleanup even on exceptions
     """
-    db_manager = None
     browser_manager = SafeBrowserManager()
     
-    try:
-        # Initialize database manager
-        db_manager = DatabaseManager()
-        
+    # ✅ FIX: Use context manager for guaranteed cleanup
+    with DatabaseManager() as db_manager:
         # Use SafeBrowserManager with guaranteed cleanup
         async with browser_manager.browser_session() as (page, session_name):
             # Initialize scraper with managed resources
@@ -503,18 +622,7 @@ async def _async_scan_task(task_info: dict):
                 logger.info(f"✅ Reported success for session: {session_name}")
 
             return scraping_result
-
-    except Exception as e:
-        logger.error(f"❌ Task failed: {e}")
-        # Note: session reporting will be handled by browser context manager cleanup
-        raise
-
-    finally:
-        # Cleanup database resources
-        if db_manager:
-            db_manager.close()
-            logger.info("✅ Database manager cleaned up")
-        # Browser cleanup is automatically handled by context manager
+    # Database and browser cleanup automatically handled by context managers
 
 @app.task(name='facebook_scraper.dispatch_scan_tasks')
 def dispatch_scan_tasks():
@@ -556,13 +664,13 @@ def dispatch_scan_tasks():
 @app.task(name='facebook_scraper.cleanup_task')
 def cleanup_task():
     """Periodic cleanup task"""
-    db_manager = None
     try:
         logger.info("🧹 Running cleanup task...")
 
-        # Database cleanup logic
-        db_manager = DatabaseManager()
-        # Add cleanup logic here
+        # ✅ FIX: Use context manager for guaranteed cleanup
+        with DatabaseManager() as db_manager:
+            # Add cleanup logic here
+            pass
 
         logger.info("✅ Cleanup completed")
         return {'status': 'success'}
@@ -570,10 +678,7 @@ def cleanup_task():
     except Exception as e:
         logger.error(f"❌ Cleanup failed: {e}")
         raise
-    finally:
-        # Cleanup database resources to avoid connection leaks
-        if db_manager:
-            db_manager.close()
+    # Database cleanup automatically handled by context manager
 
 @app.task(name='facebook_scraper.debug_session_test')
 def debug_session_test():
@@ -656,13 +761,10 @@ async def _async_scan_task_debug(task_info: dict):
     target_url = task_info.get('url', '')
     logger.info(f"🔍 DEBUG: Starting SAFE browser session setup for {target_url}")
 
-    db_manager = None
     browser_manager = SafeBrowserManager()
 
-    try:
-        # STEP 1: Database connection test
-        logger.info("🔍 DEBUG: Step 1 - Testing database connection...")
-        db_manager = DatabaseManager()
+    # ✅ FIX: Use context manager for guaranteed cleanup
+    with DatabaseManager() as db_manager:
         logger.info("✅ DEBUG: Database manager initialized")
 
         # STEP 2: Safe browser session with guaranteed cleanup
@@ -691,34 +793,21 @@ async def _async_scan_task_debug(task_info: dict):
                 logger.info(f"✅ DEBUG: Reported success for session {session_name}")
 
             return scraping_result
-        
-        # Browser cleanup is automatic from context manager
-
-    except Exception as e:
-        logger.error(f"❌ DEBUG: Error during task - {e}")
-        raise
-
-    finally:
-        logger.info("🔍 DEBUG: Final cleanup phase...")
-        # Cleanup database resources
-        if db_manager:
-            db_manager.close()
-            logger.info("✅ DEBUG: Database manager closed")
-        logger.info("✅ DEBUG: All resources cleaned up (browser auto-cleaned by context manager)")
+    # Database and browser cleanup automatically handled by context managers
+    logger.info("✅ DEBUG: All resources cleaned up")
 
 @app.task(name='facebook_scraper.health_check')
 def health_check():
     """Health check task cho monitoring"""
-    db_manager = None
     try:
-        # Test database connection
-        db_manager = DatabaseManager()
-        # Test Redis connection with connection pooling
-        import redis
-        # Use connection pool for better performance
-        redis_pool = redis.ConnectionPool(host='redis', port=6379, max_connections=10, decode_responses=True)
-        redis_client = redis.Redis(connection_pool=redis_pool)
-        redis_client.ping()
+        # ✅ FIX: Use context manager for guaranteed cleanup
+        with DatabaseManager() as db_manager:
+            # Test Redis connection with connection pooling
+            import redis
+            # Use connection pool for better performance
+            redis_pool = redis.ConnectionPool(host='redis', port=6379, max_connections=10, decode_responses=True)
+            redis_client = redis.Redis(connection_pool=redis_pool)
+            redis_client.ping()
 
         result = {
             'status': 'healthy',
@@ -733,39 +822,53 @@ def health_check():
             'timestamp': datetime.now().isoformat()
         }
         return result
-    finally:
-        # Cleanup database resources to avoid connection leaks
-        if db_manager:
-            db_manager.close()
+    # Database cleanup automatically handled by context manager
 
 @app.task(name='facebook_scraper.refresh_login_sessions')
 def refresh_login_sessions():
-    """🔄 Refresh Facebook login sessions daily to prevent logout"""
+    """🔄 Refresh Facebook login sessions to prevent logout - ENHANCED"""
     try:
         import subprocess
         logger.info("🔄 Refreshing Facebook login sessions...")
 
-        # Run auto_login.py if exists
-        if os.path.exists('/app/auto_login.py'):
-            result = subprocess.run(
-                ['python', '/app/auto_login.py'],
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minutes timeout
-            )
-
-            if result.returncode == 0:
-                logger.info("✅ Sessions refreshed successfully")
-                return {'status': 'success', 'message': 'Sessions refreshed'}
-            else:
-                logger.error(f"❌ Failed to refresh sessions: {result.stderr}")
-                return {'status': 'error', 'message': result.stderr}
-        else:
-            logger.warning("⚠️ auto_login.py not found")
+        # Determine auto_login.py path (Docker or local)
+        auto_login_paths = ['/app/auto_login.py', './auto_login.py', 'auto_login.py']
+        auto_login_path = None
+        
+        for path in auto_login_paths:
+            if os.path.exists(path):
+                auto_login_path = path
+                break
+        
+        if not auto_login_path:
+            logger.warning("⚠️ auto_login.py not found in any expected location")
             return {'status': 'skipped', 'message': 'auto_login.py not found'}
+        
+        logger.info(f"📝 Using auto_login.py from: {auto_login_path}")
+        
+        # ENHANCED: Run with proper arguments for Docker
+        # Format: python auto_login.py [account.txt] [all] [headless] [skip_existing]
+        result = subprocess.run(
+            ['python', auto_login_path, 'account.txt', 'all', 'true', 'true'],
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minutes timeout (increased for multiple accounts)
+        )
 
+        if result.returncode == 0:
+            logger.info("✅ Sessions refreshed successfully")
+            logger.debug(f"Output: {result.stdout[-500:]}")  # Last 500 chars
+            return {'status': 'success', 'message': 'Sessions refreshed'}
+        else:
+            logger.error(f"❌ Failed to refresh sessions (exit code: {result.returncode})")
+            logger.error(f"Stderr: {result.stderr}")
+            return {'status': 'error', 'message': result.stderr}
+
+    except subprocess.TimeoutExpired:
+        logger.error("❌ Session refresh timeout (>10 minutes)")
+        return {'status': 'error', 'message': 'Timeout during session refresh'}
     except Exception as e:
-        logger.error(f"❌ Session refresh error: {e}")
+        logger.error(f"❌ Session refresh error: {e}", exc_info=True)
         return {'status': 'error', 'message': str(e)}
 
 @app.task(name='facebook_scraper.browser_health_check')
