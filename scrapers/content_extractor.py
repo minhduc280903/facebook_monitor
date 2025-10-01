@@ -7,7 +7,7 @@ Handles data extraction from post elements using multiple strategies
 import re
 from logging_config import get_logger
 from typing import Optional, List, Dict, Any
-from playwright.async_api import Page
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 from utils.validation_helpers import DataValidator, FieldExtractor
 
@@ -135,7 +135,8 @@ class ContentExtractor:
                 if 'count' in field_name.lower():
                     try:
                         await element.wait_for_selector(strategy_path, timeout=3000)
-                    except:
+                    except (PlaywrightTimeoutError, PlaywrightError) as e:
+                        logger.debug(f"Wait timeout for {field_name} selector '{strategy_path}': {e}")
                         pass  # Continue even if wait fails
                 
                 elements = await element.query_selector_all(strategy_path)
@@ -165,7 +166,8 @@ class ContentExtractor:
                 if 'count' in field_name.lower():
                     try:
                         await element.wait_for_selector(f"xpath={strategy_path}", timeout=3000)
-                    except:
+                    except (PlaywrightTimeoutError, PlaywrightError) as e:
+                        logger.debug(f"Wait timeout for {field_name} xpath '{strategy_path}': {e}")
                         pass  # Continue even if wait fails
                 
                 # XPath strategy support
@@ -215,23 +217,30 @@ class ContentExtractor:
         Returns:
             Số count hoặc None
         """
-        for element in elements:
+        for idx, element in enumerate(elements):
             try:
                 # First try text content
                 text = await element.text_content()
                 if text and text.strip():
+                    # 🐛 DEBUG: Log extracted text
+                    logger.info(f"🔍 LIKE COUNT Element [{idx}] text_content: '{text.strip()[:200]}'")
                     count = self._extract_count_from_text(text.strip())
                     if count >= 0:  # 0 là valid count
+                        logger.warning(f"🎯 EXTRACTED LIKE COUNT={count} from text: '{text.strip()[:100]}'")
                         return count
                 
                 # If text is empty or no count found, try aria-label
                 aria_label = await element.get_attribute('aria-label')
                 if aria_label and aria_label.strip():
+                    # 🐛 DEBUG: Log extracted aria-label
+                    logger.info(f"🔍 LIKE COUNT Element [{idx}] aria-label: '{aria_label.strip()[:200]}'")
                     count = self._extract_count_from_text(aria_label.strip())
                     if count >= 0:  # 0 là valid count
+                        logger.warning(f"🎯 EXTRACTED LIKE COUNT={count} from aria-label: '{aria_label.strip()[:100]}'")
                         return count
                         
-            except Exception:
+            except Exception as e:
+                logger.debug(f"⚠️ Element [{idx}] extraction failed: {e}")
                 continue
         return None
     
@@ -250,7 +259,8 @@ class ContentExtractor:
                 text = await element.text_content()
                 if text and text.strip():
                     return text.strip()
-            except:
+            except (PlaywrightError, AttributeError) as e:
+                logger.debug(f"Failed to extract text from element: {e}")
                 continue
         return None
     
@@ -276,7 +286,8 @@ class ContentExtractor:
                 if src:
                     return src
                     
-            except:
+            except (PlaywrightError, AttributeError) as e:
+                logger.debug(f"Failed to extract URL from element: {e}")
                 continue
         return None
     
@@ -299,8 +310,11 @@ class ContentExtractor:
         
         # Danh sách patterns theo thứ tự ưu tiên
         patterns = [
+            r'thích:\s*(\d+[\.,]?\d*)([km]?)\s*người',        # Vietnamese "Thích: 1 người"  
+            r'like:\s*(\d+[\.,]?\d*)([km]?)\s*(?:people?|person)', # English "Like: 1 person"
             r'all reactions?:\s*(\d+[\.,]?\d*)([km]?)',        # English "All reactions:123"
             r'tất cả cảm xúc:\s*(\d+[\.,]?\d*)([km]?)',       # Vietnamese
+            r'(\d+[\.,]?\d*)([km]?)\s*(?:người|người đã.*)', # "10 người" or "10 người đã..."
             r'(\d+[\.,]?\d*)([km]?)\s*(?:likes?|reactions?)', # "123K likes"
             r'(\d+[\.,]?\d*)([km]?)'                          # Fallback: any number
         ]
@@ -310,11 +324,14 @@ class ContentExtractor:
             if match:
                 try:
                     result = self._parse_number_with_suffix(match)
-                    logger.debug(f"✅ Extracted count from '{text[:50]}...': {result}")
+                    # 🐛 DEBUG: Log which pattern matched and full text
+                    logger.info(f"🎯 LIKE Pattern '{pattern[:30]}...' matched in text: '{text[:100]}'")
+                    logger.warning(f"✅ LIKE Parsed count: {result} from full text: '{text[:200]}'")
                     return result
                 except (ValueError, TypeError):
                     continue  # Thử pattern tiếp theo
         
+        logger.info(f"❌ LIKE: No pattern matched for text: '{text[:100]}'")
         return 0
     
     def _parse_number_with_suffix(self, match: re.Match) -> int:

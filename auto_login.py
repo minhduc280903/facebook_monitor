@@ -12,7 +12,7 @@ import sys
 import time
 import pyotp
 import re
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 from utils.browser_config import get_browser_launch_options, get_init_script
 from typing import Optional, Dict, Any, List
 
@@ -288,7 +288,7 @@ class FacebookAutoLogin:
                     try_another_way_found = True
                     await asyncio.sleep(2)
                     break
-                except:
+                except (PlaywrightTimeoutError, PlaywrightError):
                     continue
             
             # Look for Authentication App option
@@ -308,7 +308,7 @@ class FacebookAutoLogin:
                     auth_app_found = True
                     await asyncio.sleep(1)
                     break
-                except:
+                except (PlaywrightTimeoutError, PlaywrightError):
                     continue
             
             # Click Continue button
@@ -326,7 +326,7 @@ class FacebookAutoLogin:
                     print("[2FA] Clicked 'Continue'")
                     await asyncio.sleep(2)
                     break
-                except:
+                except (PlaywrightTimeoutError, PlaywrightError):
                     continue
             
             # Look for 2FA code input field
@@ -360,11 +360,11 @@ class FacebookAutoLogin:
                             print("[2FA] Clicked Continue after 2FA code")
                             await asyncio.sleep(3)
                             break
-                        except:
+                        except (PlaywrightTimeoutError, PlaywrightError):
                             continue
                     
                     break
-                except:
+                except (PlaywrightTimeoutError, PlaywrightError):
                     continue
             
             return code_input_found
@@ -391,7 +391,7 @@ class FacebookAutoLogin:
                     print("[DIALOG] Clicked 'Save' for password dialog")
                     await asyncio.sleep(2)
                     break
-                except:
+                except (PlaywrightTimeoutError, PlaywrightError):
                     continue
             
             # Handle "Trust this device" dialog
@@ -409,7 +409,7 @@ class FacebookAutoLogin:
                     print("[DIALOG] Clicked 'Trust this device'")
                     await asyncio.sleep(2)
                     break
-                except:
+                except (PlaywrightTimeoutError, PlaywrightError):
                     continue
             
         except Exception as e:
@@ -489,6 +489,43 @@ class FacebookAutoLogin:
         except Exception as e:
             print(f"[ERROR] Lỗi refresh session: {e}")
             return False
+    
+    def _is_session_valid(self, session_name: str) -> bool:
+        """
+        Check if session folder exists and has required files
+        
+        Args:
+            session_name: Session folder name
+            
+        Returns:
+            True if session appears valid
+        """
+        try:
+            sessions_base_dir = os.path.join(os.getcwd(), "sessions")
+            session_path = os.path.join(sessions_base_dir, session_name)
+            
+            # Check if session folder exists
+            if not os.path.exists(session_path):
+                return False
+            
+            # Check for required Chromium session files
+            required_files = ['Local State', 'Default']
+            for required_file in required_files:
+                file_path = os.path.join(session_path, required_file)
+                if not os.path.exists(file_path):
+                    return False
+            
+            # Optional: Check if session has cookies
+            cookies_path = os.path.join(session_path, 'Default', 'Cookies')
+            network_cookies = os.path.join(session_path, 'Default', 'Network', 'Cookies')
+            
+            has_cookies = os.path.exists(cookies_path) or os.path.exists(network_cookies)
+            
+            return has_cookies
+            
+        except Exception as e:
+            print(f"[WARNING] Error checking session validity for {session_name}: {e}")
+            return False
 
     async def update_session_status(self, session_name: str):
         """Update session status in system - GIỐNG Y HỆT manual_login.py"""
@@ -540,17 +577,22 @@ class FacebookAutoLogin:
 
 
 async def auto_login_from_file(account_file: str, account_index: Optional[int] = None, 
-                              headless: bool = True):
+                              headless: bool = True, skip_existing: bool = True):
     """
-    Tự động đăng nhập từ file account.txt - GIỐNG Y HỆT manual_login.py
+    Tự động đăng nhập từ file account.txt - ENHANCED for Docker
     
     Args:
         account_file: Path to account file
         account_index: Index of account to login (0-based), None for all accounts
         headless: Run in headless mode
+        skip_existing: Skip accounts that already have valid sessions
     """
-    print("[MANUAL_LOGIN] AUTO LOGIN MODE - PHASE 3.0 (NANG CAP)")
-    print("Tu dong dang nhap Facebook voi 2FA")
+    # Detect Docker environment
+    is_docker = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER', False)
+    env_label = "DOCKER" if is_docker else "LOCAL"
+    
+    print("[AUTO_LOGIN] AUTO LOGIN MODE - PHASE 3.0 (ENHANCED)")
+    print(f"Environment: {env_label} | Headless: {headless} | Skip existing: {skip_existing}")
     print("=" * 60)
     
     async with FacebookAutoLogin() as fb_login:
@@ -573,12 +615,21 @@ async def auto_login_from_file(account_file: str, account_index: Optional[int] =
             accounts_to_process = accounts
         
         success_count = 0
+        skipped_count = 0
+        
         for i, account in enumerate(accounts_to_process):
             print(f"[PROCESS] Processing account {i+1}/{len(accounts_to_process)}: ID {account['id']}")
             
-            # Generate session name using ID - GIỐNG Y HỆT manual_login.py
+            # Generate session name using ID
             session_name = account['id']  # Session name = ID
             print(f"[SESSION] Session name: {session_name}")
+            
+            # Check if session already exists and is valid
+            if skip_existing and fb_login._is_session_valid(session_name):
+                print(f"[SKIP] Session {session_name} already exists and valid, skipping login")
+                skipped_count += 1
+                success_count += 1  # Count as success
+                continue
             
             try:
                 # Setup browser for this account
@@ -608,59 +659,91 @@ async def auto_login_from_file(account_file: str, account_index: Optional[int] =
                 print("[WAIT] Waiting 10 seconds before next account...")  # Tăng từ 5 lên 10
                 await asyncio.sleep(10)  # Tăng từ 5 lên 10
         
-        print(f"[RESULT] Hoàn thành! {success_count}/{len(accounts_to_process)} account(s) thành công")
+        # Print summary
+        print("")
+        print("=" * 60)
+        print("[RESULT] AUTO LOGIN SUMMARY")
+        print("=" * 60)
+        print(f"Total accounts processed: {len(accounts_to_process)}")
+        print(f"✅ Successful logins: {success_count - skipped_count}")
+        print(f"⏭️  Skipped (already valid): {skipped_count}")
+        print(f"❌ Failed: {len(accounts_to_process) - success_count}")
+        print("=" * 60)
+        
         return success_count > 0
 
 
 def main():
-    """Main function với command line interface - GIỐNG Y HỆT manual_login.py"""
+    """Main function với command line interface - ENHANCED for Docker"""
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║        FACEBOOK POST MONITOR - ENTERPRISE EDITION           ║")
-    print("║           PHASE 3.0 - AUTO LOGIN WITH 2FA (NÂNG CẤP)         ║")
+    print("║           PHASE 3.0 - AUTO LOGIN WITH 2FA (ENHANCED)        ║")
     print("║                                                              ║")
     print("║  🤖 Tự động đăng nhập Facebook với 2FA authenticator        ║")
     print("║  🔐 Tích hợp với session pool và proxy management           ║")
+    print("║  🐳 Docker-ready với skip existing sessions                 ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     
     # Parse command line arguments
+    # Usage: python auto_login.py [account.txt] [index|all] [headless] [skip_existing]
     account_file = "account.txt"
     account_index = None
     headless = True  # ✅ Default to True for Docker compatibility
+    skip_existing = True  # ✅ Default skip existing for efficiency
     
     if len(sys.argv) > 1:
         account_file = sys.argv[1]
     
     if len(sys.argv) > 2:
-        try:
-            account_index = int(sys.argv[2])
-        except ValueError:
-            print("[ERROR] Account index phải là số")
-            return
+        arg = sys.argv[2].lower()
+        if arg == 'all':
+            account_index = None  # Login all accounts
+        else:
+            try:
+                account_index = int(arg)
+            except ValueError:
+                print(f"[ERROR] Account index phải là số hoặc 'all', nhận được: {arg}")
+                sys.exit(1)
     
     if len(sys.argv) > 3:
         headless = sys.argv[3].lower() in ['true', '1', 'yes']
+    
+    if len(sys.argv) > 4:
+        skip_existing = sys.argv[4].lower() in ['true', '1', 'yes']
+    
+    print(f"[CONFIG] Account file: {account_file}")
+    print(f"[CONFIG] Account index: {'all' if account_index is None else account_index}")
+    print(f"[CONFIG] Headless: {headless}")
+    print(f"[CONFIG] Skip existing: {skip_existing}")
+    print()
     
     try:
         success = asyncio.run(
             auto_login_from_file(
                 account_file=account_file,
                 account_index=account_index,
-                headless=headless
+                headless=headless,
+                skip_existing=skip_existing
             )
         )
         
         if success:
             print("\n🎉 Auto login hoàn thành!")
             print("Bây giờ bạn có thể chạy các worker để sử dụng session này.")
+            sys.exit(0)  # Success exit code
         else:
-            print("\n❌ Auto login thất bại.")
+            print("\n❌ Auto login thất bại - không có session nào thành công!")
+            sys.exit(1)  # Failure exit code
+            
     except KeyboardInterrupt:
         print("\n⏹️ Auto login bị hủy bởi người dùng.")
+        sys.exit(130)  # Standard exit code for Ctrl+C
     except Exception as e:
         print(f"\n💥 Lỗi: {e}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)  # Error exit code
 
 
 if __name__ == "__main__":

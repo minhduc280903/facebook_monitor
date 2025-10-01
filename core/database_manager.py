@@ -394,7 +394,8 @@ class DatabaseManager:
                         item['like_count'],
                         item['comment_count']
                     ))
-                except:
+                except (ValueError, KeyError, TypeError, AttributeError) as e:
+                    logger.debug(f"Skipping invalid interaction entry: {e}")
                     # Skip invalid entries
                     continue
             

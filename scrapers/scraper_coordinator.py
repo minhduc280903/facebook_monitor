@@ -13,7 +13,7 @@ import asyncio
 import random
 import re
 
-from playwright.async_api import Page
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 from core.database_manager import DatabaseManager
 from .browser_controller import BrowserController, CaptchaException
@@ -136,7 +136,8 @@ class ScraperCoordinator:
                         text = await element.inner_text()
                         if text and any(word in text.lower() for word in ['ago', 'hour', 'minute', 'day', 'yesterday']):
                             return text.strip()
-                except:
+                except (PlaywrightError, AttributeError) as e:
+                    logger.debug(f"Failed to extract post time from element: {e}")
                     continue
             
             logger.debug("⚠️ Không tìm thấy thời gian bài viết")

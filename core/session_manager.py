@@ -567,43 +567,143 @@ class SessionManager:
 
     def checkout_session_with_proxy(self, proxy_manager, timeout: int = 30) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
-        Checkout session với proxy cố định được bind sẵn
-
+        Checkout session cùng với proxy đã được bind - PERSISTENT BINDING
+        
         Args:
             proxy_manager: Instance của ProxyManager
-            timeout: Thời gian chờ tối đa (giây)
-
+            timeout: Timeout in seconds
+            
         Returns:
-            Tuple (session_name, proxy_config) nếu thành công, None nếu không có
+            Tuple (session_name, proxy_config) nếu thành công, None nếu thất bại
         """
-        start_time = time.time()
-        attempt_count = 0
-        max_attempts = min(timeout, 10)  # Limit attempts to prevent excessive polling
-
-        while time.time() - start_time < timeout and attempt_count < max_attempts:
-            attempt_count += 1
-
-            # FIX: Atomic operation - process cooldowns and checkout trong cùng lock
-            try:
-                result = self._execute_with_locks(lambda: (
-                    self._process_cooldowns(),  # ✅ ATOMIC with checkout
-                    self._checkout_session_with_bound_proxy(proxy_manager)
-                )[1])  # Return checkout result only
+        import os
+        
+        try:
+            start_time = time.time()
+            
+            # Process cooldowns first
+            self._process_cooldowns()
+            
+            while time.time() - start_time < timeout:
+                # Try each available session
+                for session_name, session_resource in list(self.resource_pool.items()):
+                    # Skip if in use or quarantined
+                    if session_resource.status == "IN_USE" or session_resource.is_quarantined():
+                        continue
+                    
+                    # Skip if needs login or disabled
+                    if session_resource.status in ["NEEDS_LOGIN", "DISABLED"]:
+                        continue
+                    
+                    try:
+                        # Get available proxy IDs from proxy manager - WITH HEALTH CHECK
+                        available_proxy_ids = []
+                        
+                        # CRITICAL FIX: In Docker, skip health check to avoid blocking all proxies
+                        is_docker = os.environ.get('DOCKER_ENV') == 'true' or os.path.exists('/.dockerenv')
+                        
+                        logger.debug(f"🔍 Docker mode: {is_docker}, Total proxies in pool: {len(proxy_manager.resource_pool)}")
+                        
+                        for proxy_id, proxy_resource in proxy_manager.resource_pool.items():
+                            # Check proxy config exists
+                            proxy_config = proxy_resource.metadata.get("config", {})
+                            if not proxy_config:
+                                logger.warning(f"⚠️ Proxy {proxy_id} skipped - no config in metadata")
+                                continue
+                            
+                            # Check if proxy is quarantined
+                            if proxy_resource.is_quarantined():
+                                logger.debug(f"⚠️ Proxy {proxy_id} skipped - quarantined")
+                                continue
+                            
+                            # ✅ FIX: ALWAYS run health check with caching (both Docker & non-Docker)
+                            # Check if recently verified (within last 5 minutes) to avoid repeated checks
+                            last_checked = proxy_resource.metadata.get("last_checked")
+                            recently_verified = False
+                            if last_checked:
+                                try:
+                                    last_check_time = datetime.fromisoformat(last_checked)
+                                    if datetime.now() - last_check_time < timedelta(minutes=5):
+                                        recently_verified = True
+                                except Exception as e:
+                                    logger.debug(f"⚠️ Failed to parse last_checked time for proxy {proxy_id}: {e}")
+                            
+                            if recently_verified:
+                                available_proxy_ids.append(proxy_id)
+                                logger.debug(f"✅ Proxy {proxy_id} recently verified (cached), added")
+                            else:
+                                # Run health check for ALL proxies (Docker & non-Docker)
+                                proxy_config_copy = proxy_config.copy()
+                                proxy_config_copy["proxy_id"] = proxy_id
+                                
+                                if proxy_manager.health_check_proxy(proxy_config_copy):
+                                    # Update last_checked timestamp to cache result
+                                    proxy_resource.metadata["last_checked"] = datetime.now().isoformat()
+                                    available_proxy_ids.append(proxy_id)
+                                    logger.debug(f"✅ Proxy {proxy_id} verified healthy (Docker={is_docker})")
+                                else:
+                                    logger.warning(f"⚠️ Proxy {proxy_id} failed health check, skipping")
+                        
+                        if not available_proxy_ids:
+                            if is_docker:
+                                logger.error(f"❌ No proxies available even in Docker mode - check proxies.txt")
+                                logger.error(f"📊 Debug: total proxies in pool: {len(proxy_manager.resource_pool)}")
+                                for pid, pres in list(proxy_manager.resource_pool.items())[:3]:
+                                    logger.error(f"📊 Sample proxy {pid}: status={pres.status}, quarantined={pres.is_quarantined()}, has_config={bool(pres.metadata.get('config'))}")
+                            continue
+                        
+                        # Get or assign bound proxy for this session
+                        bound_proxy_id = self.proxy_binder.get_proxy_for_session(
+                            session_name, available_proxy_ids
+                        )
+                        
+                        if not bound_proxy_id:
+                            continue
+                        
+                        # Checkout the bound proxy
+                        proxy_resource = proxy_manager.resource_pool.get(bound_proxy_id)
+                        if not proxy_resource:
+                            logger.warning(f"⚠️ Bound proxy {bound_proxy_id} not found in pool, trying next session")
+                            continue
+                        
+                        # In Docker mode, accept any non-quarantined proxy regardless of status
+                        if not is_docker and proxy_resource.status != "READY":
+                            logger.warning(f"⚠️ Bound proxy {bound_proxy_id} not ready (status: {proxy_resource.status}), trying next session")
+                            continue
+                        
+                        # In Docker mode, check if proxy is quarantined
+                        if is_docker and proxy_resource.is_quarantined():
+                            logger.warning(f"⚠️ Bound proxy {bound_proxy_id} is quarantined in Docker mode, trying next session")
+                            continue
+                        
+                        # Mark proxy as IN_USE
+                        proxy_resource.status = "IN_USE"
+                        proxy_resource.last_used_timestamp = datetime.now()
+                        
+                        # Prepare proxy config
+                        proxy_config = proxy_resource.metadata.get("config", {}).copy()
+                        proxy_config["proxy_id"] = bound_proxy_id
+                        
+                        # Mark session as IN_USE
+                        session_resource = self.resource_pool[session_name]
+                        session_resource.status = "IN_USE"
+                        session_resource.last_used_timestamp = datetime.now()
+                        
+                        logger.info(f"🔗 Session-Proxy bound checkout: {session_name} -> {bound_proxy_id}")
+                        return (session_name, proxy_config)
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Error binding session {session_name}: {e}")
+                        continue
                 
-                if result:
-                    self._execute_with_locks(self._sync_resources_to_file)
-                    return result
-            except Exception as e:
-                logger.debug(f"Checkout attempt {attempt_count} failed: {e}")
-
-            # Exponential backoff with jitter to reduce contention
-            import random
-            sleep_time = min(0.5 * (2 ** (attempt_count - 1)), 2.0)  # Max 2 seconds
-            sleep_time += random.uniform(0, 0.1)  # Add jitter
-            time.sleep(sleep_time)
-
-        logger.warning(f"⏰ Timeout checkout session với proxy sau {timeout}s ({attempt_count} attempts)")
-        return None
+                time.sleep(1)
+            
+            logger.warning("⚠️ Could not bind any available session with proxy")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error in session-proxy checkout: {e}")
+            return None
     
     def _checkout_session_with_bound_proxy(self, proxy_manager) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
@@ -628,11 +728,39 @@ class SessionManager:
             # Try each available session to find one that can get a proxy
             for session_name in available_sessions:
                 try:
-                    # Get available proxy IDs from proxy manager
+                    # Get available proxy IDs from proxy manager - WITH HEALTH CHECK
                     available_proxy_ids = []
                     for proxy_id, proxy_resource in proxy_manager.resource_pool.items():
                         if proxy_resource.status == "READY" and not proxy_resource.is_quarantined():
-                            available_proxy_ids.append(proxy_id)
+                            # CRITICAL: Verify proxy health before assigning
+                            proxy_config = proxy_resource.metadata.get("config", {})
+                            if proxy_config:
+                                proxy_config["proxy_id"] = proxy_id  # Add proxy_id for health check
+                                
+                                # Check if proxy recently passed health check (within last 5 minutes)
+                                last_checked = proxy_resource.metadata.get("last_checked")
+                                if last_checked:
+                                    try:
+                                        from datetime import datetime, timedelta
+                                        last_check_time = datetime.fromisoformat(last_checked)
+                                        if datetime.now() - last_check_time < timedelta(minutes=5):
+                                            # Recently verified, trust it
+                                            available_proxy_ids.append(proxy_id)
+                                            continue
+                                    except (ValueError, TypeError) as e:
+                                        logger.debug(f"Failed to parse last_checked timestamp for proxy {proxy_id}: {e}")
+                                        pass
+                                
+                                # Run health check (sync version)
+                                if proxy_manager.health_check_proxy(proxy_config):
+                                    # Update last_checked timestamp to cache result
+                                    proxy_resource.metadata["last_checked"] = datetime.now().isoformat()
+                                    available_proxy_ids.append(proxy_id)
+                                    logger.debug(f"✅ Proxy {proxy_id} verified healthy")
+                                else:
+                                    logger.warning(f"⚠️ Proxy {proxy_id} failed health check, skipping")
+                            else:
+                                logger.warning(f"⚠️ Proxy {proxy_id} has no config, skipping")
                     
                     if not available_proxy_ids:
                         continue
