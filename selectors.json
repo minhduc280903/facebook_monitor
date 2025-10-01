@@ -30,9 +30,15 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": ".//div[contains(text(), 'All reactions:')]/parent::*//span[string-length(normalize-space(text())) > 0 and string-length(normalize-space(text())) < 10 and translate(normalize-space(text()), '0123456789,.KM', '') = '']",
+        "path": ".//div[contains(text(), 'Tất cả cảm xúc:')]/parent::*//span[string-length(normalize-space(text())) > 0 and string-length(normalize-space(text())) < 10 and translate(normalize-space(text()), '0123456789,.KM', '') = '']",
         "priority": 1,
-        "description": "✅ WORKING 100%: Total reactions count (English)"
+        "description": "✅ WORKING: Vietnamese total reactions"
+      },
+      {
+        "type": "xpath",
+        "path": ".//div[contains(text(), 'All reactions:')]/parent::*//span[string-length(normalize-space(text())) > 0 and string-length(normalize-space(text())) < 10 and translate(normalize-space(text()), '0123456789,.KM', '') = '']",
+        "priority": 2,
+        "description": "✅ WORKING: English total reactions"
       }
     ],
     "validation": {
@@ -46,15 +52,27 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": ".//span[contains(text(), 'comment')]",
+        "path": ".//span[contains(text(), 'bình luận')]",
         "priority": 1,
+        "description": "✅ WORKING: Vietnamese '13 bình luận'"
+      },
+      {
+        "type": "xpath",
+        "path": ".//span[contains(text(), 'comment')]",
+        "priority": 2,
         "description": "✅ WORKING: English '11 comments'"
       },
       {
         "type": "xpath",
+        "path": ".//div[@role='button']//span[contains(text(), 'bình luận')]",
+        "priority": 3,
+        "description": "✅ Vietnamese comment button (0 comments)"
+      },
+      {
+        "type": "xpath",
         "path": ".//div[@role='button']//span[contains(text(), 'Comment')]",
-        "priority": 2,
-        "description": "✅ WORKING: Comment button (fallback for 0 comments)"
+        "priority": 4,
+        "description": "✅ English comment button (0 comments)"
       }
     ],
     "validation": {
@@ -68,8 +86,20 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": ".//span[contains(text(), 'share')]",
+        "path": ".//span[contains(text(), 'lượt chia sẻ')]",
         "priority": 1,
+        "description": "✅ Vietnamese '18 lượt chia sẻ'"
+      },
+      {
+        "type": "xpath",
+        "path": ".//span[contains(text(), 'chia sẻ')]",
+        "priority": 2,
+        "description": "✅ Vietnamese '18 chia sẻ' (short form)"
+      },
+      {
+        "type": "xpath",
+        "path": ".//span[contains(text(), 'share')]",
+        "priority": 3,
         "description": "✅ English '18 shares'"
       }
     ],
