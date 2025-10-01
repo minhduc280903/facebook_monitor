@@ -493,6 +493,38 @@ class SessionManager:
                     yield
             else:
                 yield
+
+    def _atomic_try_mark_session_in_use(self, session_name: str) -> bool:
+        """
+        ✅ FIX RACE CONDITION: Atomically check if session is available and mark as IN_USE.
+        
+        This method is thread-safe and prevents multiple workers from checking out the same session.
+        
+        Args:
+            session_name: Name of session to mark
+            
+        Returns:
+            True if successfully marked as IN_USE, False if already taken or unavailable
+        """
+        with self.lock:
+            if session_name not in self.resource_pool:
+                return False
+            
+            session_resource = self.resource_pool[session_name]
+            
+            # Re-check all availability conditions atomically
+            if session_resource.status == "IN_USE":
+                return False
+            if session_resource.is_quarantined():
+                return False
+            if session_resource.status in ["NEEDS_LOGIN", "DISABLED"]:
+                return False
+            
+            # Mark as IN_USE atomically
+            session_resource.status = "IN_USE"
+            session_resource.last_used_timestamp = datetime.now()
+            
+            return True
     
     def _sync_resources_to_file(self, force: bool = False):
         """
@@ -684,10 +716,12 @@ class SessionManager:
                         proxy_config = proxy_resource.metadata.get("config", {}).copy()
                         proxy_config["proxy_id"] = bound_proxy_id
                         
-                        # Mark session as IN_USE
-                        session_resource = self.resource_pool[session_name]
-                        session_resource.status = "IN_USE"
-                        session_resource.last_used_timestamp = datetime.now()
+                        # ✅ FIX RACE CONDITION: Atomically mark session as IN_USE
+                        # This prevents multiple workers from checking out the same session
+                        if not self._atomic_try_mark_session_in_use(session_name):
+                            # Another worker grabbed this session, try next one
+                            logger.debug(f"⚠️ Session {session_name} was taken by another worker, trying next...")
+                            continue
                         
                         logger.info(f"🔗 Session-Proxy bound checkout: {session_name} -> {bound_proxy_id}")
                         return (session_name, proxy_config)
@@ -787,10 +821,10 @@ class SessionManager:
                     proxy_config = proxy_resource.metadata.get("config", {}).copy()
                     proxy_config["proxy_id"] = bound_proxy_id
                     
-                    # Mark session as IN_USE
-                    session_resource = self.resource_pool[session_name]
-                    session_resource.status = "IN_USE"
-                    session_resource.last_used_timestamp = datetime.now()
+                    # ✅ FIX RACE CONDITION: Atomically mark session as IN_USE
+                    if not self._atomic_try_mark_session_in_use(session_name):
+                        logger.debug(f"⚠️ Session {session_name} was taken by another worker, trying next...")
+                        continue
                     
                     logger.info(f"🔗 Session-Proxy bound checkout: {session_name} -> {bound_proxy_id}")
                     return (session_name, proxy_config)
@@ -990,7 +1024,7 @@ class SessionManager:
     
     def _process_cooldowns(self) -> int:
         """
-        Process quarantined resources and release those past cooldown period.
+        ✅ FIX RACE CONDITION: Process quarantined resources with thread-safe status updates.
         
         Returns:
             Number of resources released from quarantine
@@ -998,14 +1032,16 @@ class SessionManager:
         current_time = datetime.now()
         released_count = 0
         
-        for resource in self.resource_pool.values():
-            if resource.status == "QUARANTINED" and resource.quarantine_until_timestamp:
-                if current_time >= resource.quarantine_until_timestamp:
-                    resource.status = "READY"
-                    resource.quarantine_until_timestamp = None
-                    resource.consecutive_failures = 0  # Reset failures after cooldown
-                    released_count += 1
-                    logger.info(f"🎆 Resource {resource.id} released from quarantine")
+        # Use lock to prevent race conditions when multiple threads call this
+        with self.lock:
+            for resource in self.resource_pool.values():
+                if resource.status == "QUARANTINED" and resource.quarantine_until_timestamp:
+                    if current_time >= resource.quarantine_until_timestamp:
+                        resource.status = "READY"
+                        resource.quarantine_until_timestamp = None
+                        resource.consecutive_failures = 0  # Reset failures after cooldown
+                        released_count += 1
+                        logger.info(f"🎆 Resource {resource.id} released from quarantine")
         
         return released_count
     
