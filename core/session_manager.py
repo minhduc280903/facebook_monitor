@@ -405,11 +405,23 @@ class SessionManager:
                 data = json.load(f)
                 
                 # ⚡ MIGRATION: Convert old format to new ManagedResource format
-                if data and isinstance(list(data.values())[0], (str, dict)):
-                    migrated = self._migrate_old_format(data)
-                    if migrated:
-                        self._write_status_file(migrated)
-                        return migrated
+                # ✅ FIX: Only migrate if TRULY old format (missing 'type' field)
+                if data:
+                    first_value = list(data.values())[0]
+                    # Old format: string status OR dict without 'type' field
+                    if isinstance(first_value, str):
+                        # Very old format: {"session_1": "READY"}
+                        migrated = self._migrate_old_format(data)
+                        if migrated:
+                            self._write_status_file(migrated)
+                            return migrated
+                    elif isinstance(first_value, dict) and 'type' not in first_value:
+                        # Old dict format: {"session_1": {"status": "READY", "failure_count": 0}}
+                        migrated = self._migrate_old_format(data)
+                        if migrated:
+                            self._write_status_file(migrated)
+                            return migrated
+                    # Else: New format with 'type' field → no migration needed
                 
                 return data
         except (FileNotFoundError, json.JSONDecodeError) as e:
