@@ -391,7 +391,9 @@ class SessionManager:
                     resource.status = resource_data.get("status", "NEEDS_LOGIN")
                 self.resource_pool[resource_id] = resource
         
-        logger.info(f"📋 Loaded {len(self.resource_pool)} resources to memory")
+        # ✅ REDUCED LOG LEVEL: This is called frequently in atomic lock during checkout
+        # Change from INFO to DEBUG to avoid log spam with multiple workers
+        logger.debug(f"📋 Loaded {len(self.resource_pool)} resources to memory")
     
     def _read_status_file(self) -> Dict[str, Any]:
         """
