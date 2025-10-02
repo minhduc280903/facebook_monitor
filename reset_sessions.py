@@ -82,14 +82,23 @@ def show_status():
     print("=" * 50)
     
     # Sessions status
-    if os.path.exists("session_status.json"):
-        with open("session_status.json", 'r') as f:
-            sessions = json.load(f)
-        print(f"🔐 SESSIONS ({len(sessions)} total):")
-        for sid, data in sessions.items():
-            status = data.get('status', 'unknown')
-            role = data.get('role', 'unknown')
-            print(f"  - {sid}: {status} ({role})")
+    session_file = "session_status.json"
+    if os.path.exists(session_file):
+        try:
+            with open(session_file, 'r') as f:
+                sessions = json.load(f)
+            print(f"🔐 SESSIONS ({len(sessions)} total):")
+            # Show first 5 only to avoid clutter
+            for sid, data in list(sessions.items())[:5]:
+                status = data.get('status', 'unknown')
+                role = data.get('role', 'unknown')
+                print(f"  - {sid}: {status} ({role})")
+            if len(sessions) > 5:
+                print(f"  ... and {len(sessions) - 5} more")
+        except Exception as e:
+            print(f"⚠️ Error reading sessions: {e}")
+    else:
+        print(f"⚠️ {session_file} not found")
     
     print()
     
@@ -100,7 +109,16 @@ def show_status():
         print(f"🌐 PROXIES ({len(proxies)} total):")
         for pid, data in proxies.items():
             status = data.get('status', 'unknown')
-            host = data.get('metadata', {}).get('config', {}).get('host', 'unknown')
+            # ✅ FIX: Handle both string and dict config formats
+            config = data.get('metadata', {}).get('config', {})
+            if isinstance(config, str):
+                # String format: "host:port:user:pass"
+                host = config.split(':')[0] if ':' in config else config
+            elif isinstance(config, dict):
+                # Dict format: {"host": "...", "port": ...}
+                host = config.get('host', 'unknown')
+            else:
+                host = 'unknown'
             print(f"  - {pid}: {status} ({host})")
 
 if __name__ == "__main__":
