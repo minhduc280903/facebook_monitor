@@ -287,6 +287,62 @@ class RedisConfig(BaseSettings):
     }
 
 
+class TimeoutConfig(BaseSettings):
+    """
+    ✅ CENTRALIZED TIMEOUTS - No more magic numbers!
+    
+    All timeout/delay constants in one place for easy tuning.
+    """
+    
+    # Browser operation timeouts
+    browser_launch_timeout: int = Field(
+        default=60,
+        description="Timeout for browser launch (seconds)"
+    )
+    page_navigation_timeout: int = Field(
+        default=30,
+        description="Timeout for page navigation (seconds)"
+    )
+    element_wait_timeout: int = Field(
+        default=5,
+        description="Timeout for waiting for elements (seconds)"
+    )
+    
+    # Session/Proxy checkout timeouts
+    session_checkout_timeout: int = Field(
+        default=60,
+        description="Timeout for session-proxy checkout (seconds)"
+    )
+    
+    # Human-like delays (anti-detection)
+    warmup_delay_min: float = Field(
+        default=2.0,
+        description="Minimum warmup delay (seconds)"
+    )
+    warmup_delay_max: float = Field(
+        default=5.0,
+        description="Maximum warmup delay (seconds)"
+    )
+    
+    # Scroll delays
+    scroll_delay_min: float = Field(
+        default=0.5,
+        description="Minimum scroll delay (seconds)"
+    )
+    scroll_delay_max: float = Field(
+        default=1.5,
+        description="Maximum scroll delay (seconds)"
+    )
+    
+    model_config = {
+        "env_prefix": "TIMEOUT_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore"
+    }
+
+
 class ScrapingConfig(BaseSettings):
     """Scraping configuration settings"""
 
@@ -374,6 +430,7 @@ class Settings(BaseSettings):
     redis: RedisConfig = RedisConfig()
     scraping: ScrapingConfig = ScrapingConfig()
     resource_management: ResourceManagementConfig = ResourceManagementConfig()
+    timeouts: TimeoutConfig = TimeoutConfig()  # ✅ Centralized timeouts
 
     model_config = {
         "env_file": ".env",
@@ -410,37 +467,123 @@ def get_development_config() -> Settings:
 
 # Configuration validation
 def validate_config(config_instance: Settings) -> bool:
-    """Validate configuration settings"""
+    """
+    Comprehensive configuration validation with detailed error messages.
+    
+    ✅ SAFE: Only validates, doesn't change anything
+    
+    Checks:
+    - Database connection parameters
+    - Required directories exist
+    - Port numbers are valid
+    - Threshold values are reasonable
+    - File paths are accessible
+    
+    Returns:
+        bool: True if config is valid, False otherwise
+    """
+    import os
+    
+    validation_errors = []
+    
     try:
-        # Check critical values
-        if config_instance.circuit_breaker.database_failure_threshold < 1:
-            return False
-        if config_instance.session.failure_threshold < 1:
-            return False
+        # ===== DATABASE VALIDATION =====
+        # Check database config values
+        if config_instance.database.port < 1 or config_instance.database.port > 65535:
+            validation_errors.append(f"Invalid database port: {config_instance.database.port} (must be 1-65535)")
+        
+        if not config_instance.database.host:
+            validation_errors.append("Database host is empty")
+        
+        if not config_instance.database.name:
+            validation_errors.append("Database name is empty")
+        
+        if config_instance.database.connection_timeout < 1:
+            validation_errors.append(f"Database connection timeout too low: {config_instance.database.connection_timeout}s")
+        
+        # ===== REDIS VALIDATION =====
+        if config_instance.redis.port < 1 or config_instance.redis.port > 65535:
+            validation_errors.append(f"Invalid Redis port: {config_instance.redis.port}")
+        
         if config_instance.redis.socket_connect_timeout < 1:
+            validation_errors.append("Redis socket_connect_timeout must be >= 1")
+        
+        # ===== THRESHOLD VALIDATION =====
+        if config_instance.circuit_breaker.database_failure_threshold < 1:
+            validation_errors.append("Circuit breaker database_failure_threshold must be >= 1")
+        
+        if config_instance.session.failure_threshold < 1:
+            validation_errors.append("Session failure_threshold must be >= 1")
+        
+        if config_instance.resource_management.session_failure_threshold < 1:
+            validation_errors.append("Resource management session_failure_threshold must be >= 1")
+        
+        if config_instance.resource_management.session_success_rate_threshold < 0 or \
+           config_instance.resource_management.session_success_rate_threshold > 1:
+            validation_errors.append("Session success_rate_threshold must be between 0 and 1")
+        
+        # ===== DIRECTORY VALIDATION =====
+        required_dirs = ['sessions', 'logs']
+        for dir_name in required_dirs:
+            if not os.path.exists(dir_name):
+                validation_errors.append(f"Required directory missing: {dir_name}/")
+        
+        # ===== FILE VALIDATION =====
+        # Check if critical config files exist (warn, don't fail)
+        config_files = {
+            'proxies.txt': 'Proxy configuration file',
+            'targets.json': 'Target URLs configuration',
+            'selectors.json': 'CSS selectors configuration'
+        }
+        
+        for file_path, description in config_files.items():
+            if not os.path.exists(file_path):
+                print(f"⚠️ WARNING: {description} not found: {file_path}")
+                # Don't add to errors - these can be created on first run
+        
+        # ===== SCRAPING VALIDATION =====
+        if config_instance.scraping.post_tracking_days < 1:
+            validation_errors.append("Post tracking days must be >= 1")
+        
+        if config_instance.scraping.max_posts_per_page < 1:
+            validation_errors.append("Max posts per page must be >= 1")
+        
+        # ===== REPORT VALIDATION RESULTS =====
+        if validation_errors:
+            print("❌ Configuration validation FAILED:")
+            for i, error in enumerate(validation_errors, 1):
+                print(f"  {i}. {error}")
             return False
+        
+        print("✅ Configuration validation PASSED")
         return True
-    except Exception:
+        
+    except Exception as e:
+        print(f"❌ Configuration validation error: {e}")
         return False
 
 
 if __name__ == "__main__":
     # Test configuration loading
+    import sys
+    import io
+    
+    # Fix Windows console encoding for emoji
+    if sys.platform == 'win32':
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    
     print("🔧 Testing Configuration Loading...")
 
     main_config = settings
     print(f"Environment: {main_config.environment}")
     print(f"Database host: {main_config.database.host}:{main_config.database.port}/{main_config.database.name}")
-    print(
-        f"Session failure threshold: {main_config.session.failure_threshold}"
-    )
-    print(
-        "Circuit breaker DB threshold: "
-        f"{main_config.circuit_breaker.database_failure_threshold}"
-    )
+    print(f"Session failure threshold: {main_config.session.failure_threshold}")
+    print(f"Circuit breaker DB threshold: {main_config.circuit_breaker.database_failure_threshold}")
 
     # Validate
+    print("\n" + "="*60)
+    print("CONFIGURATION VALIDATION")
+    print("="*60)
     is_valid = validate_config(main_config)
-    print(f"Configuration valid: {is_valid}")
-
-    print("✅ Configuration loading test completed!")
+    print(f"\nFinal result: {'VALID ✅' if is_valid else 'INVALID ❌'}")
+    print("="*60)
