@@ -574,8 +574,11 @@ class ProxyManager:
     
     def health_check_proxy(self, proxy_config: Dict[str, Any]) -> bool:
         """
-        Enhanced health check với response time tracking (synchronous version for compatibility)
+        Enhanced health check với response time tracking (synchronous version)
         
+        ⚠️ WARNING: This is a BLOCKING sync operation using requests.Session().get()
+        
+        DO NOT call this from async context (will block event loop)!
         For async operations, use health_check_proxy_async() instead.
         
         Args:
@@ -627,17 +630,43 @@ class ProxyManager:
                     # Accept 200, 301, 302 as success
                     if response.status_code in [200, 301, 302]:
                         logger.debug(f"✅ Proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
+                        # 🔥 FIX #3: Reset consecutive failures on success
+                        if proxy_id and proxy_id in self.resource_pool:
+                            self.resource_pool[proxy_id].consecutive_failures = 0
+                            # 🔥 CRITICAL FIX: Persist success immediately
+                            self._sync_resources_to_file()
                         return True
                 except Exception as e:
                     logger.debug(f"Endpoint {endpoint} failed for {proxy_id}: {str(e)[:50]}")
                     continue
             
-            # All endpoints failed
+            # 🔥 FIX #3: AGGRESSIVE QUARANTINE - All endpoints failed
             logger.warning(f"⚠️ Proxy health check failed: {proxy_id} - All test endpoints failed")
+            
+            # Increment consecutive failures and quarantine if threshold reached
+            if proxy_id and proxy_id in self.resource_pool:
+                resource = self.resource_pool[proxy_id]
+                resource.consecutive_failures += 1
+                logger.warning(f"🚨 Proxy {proxy_id} consecutive failures: {resource.consecutive_failures}")
+                
+                # 🔥 CRITICAL FIX: Persist failure count immediately
+                self._sync_resources_to_file()
+                
+                # Quarantine immediately after 2 consecutive health check failures
+                if resource.consecutive_failures >= 2:
+                    self.quarantine_resource(
+                        proxy_id, 
+                        f"Health check failed {resource.consecutive_failures} times consecutively"
+                    )
+                    logger.critical(f"⛔ Proxy {proxy_id} QUARANTINED after repeated health check failures")
+            
             return False
                 
         except Exception as e:
             logger.warning(f"⚠️ Proxy health check error: {proxy_id} - {e}")
+            # Also count as failure
+            if proxy_id and proxy_id in self.resource_pool:
+                self.resource_pool[proxy_id].consecutive_failures += 1
             return False
     
     async def health_check_proxy_async(self, proxy_config: Dict[str, Any]) -> bool:

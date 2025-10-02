@@ -276,7 +276,7 @@ class DatabaseManager:
             return set()
 
     def add_new_post(self, post_signature: str, post_url: str, source_url: str, author_name: Optional[str] = None, author_id: Optional[str] = None, post_content: Optional[str] = None) -> bool:
-        """Thêm bài viết mới vào bảng posts với thông tin chi tiết."""
+        """Thêm bài viết mới vào bảng posts với thông tin chi tiết và retry logic."""
         now_utc = datetime.now(timezone.utc)
         tracking_days = settings.scraping.post_tracking_days
         expires_utc = now_utc + timedelta(days=tracking_days)
@@ -287,15 +287,36 @@ class DatabaseManager:
         INSERT INTO posts (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, status)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'TRACKING')
         """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(sql, (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc))
-            logger.info("✅ Post added: %s... (expires: %s)", post_signature[:30], expires_utc.strftime('%Y-%m-%d %H:%M'))
-            return True
-        except Exception as e:
-            logger.error(f"❌ Lỗi thêm post mới: {e}")
-            return False
+        
+        # 🔄 FIX: Retry logic cho transient errors
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                with self.get_connection() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(sql, (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc))
+                logger.info("✅ Post added: %s... (expires: %s)", post_signature[:30], expires_utc.strftime('%Y-%m-%d %H:%M'))
+                return True
+                
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning("⚠️ Transient DB error adding post (attempt %d/%d): %s - Retrying...", 
+                                 attempt + 1, max_retries, e)
+                    import time
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                else:
+                    logger.error(f"❌ Failed to add post after {max_retries} retries: {e}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"❌ Lỗi thêm post mới: {e}")
+                return False
+        
+        return False
 
     def get_post_by_signature(self, post_signature: str) -> Optional[Dict[str, Any]]:
         """Lấy thông tin chi tiết của một post từ bảng posts."""
@@ -312,32 +333,33 @@ class DatabaseManager:
 
     def log_interaction(self, post_signature: str, log_timestamp_utc: str, like_count: int, comment_count: int) -> bool:
         """
-        Ghi log tương tác vào bảng interactions với duplicate prevention.
+        Ghi log tương tác vào bảng interactions với duplicate prevention và retry logic.
         
-        ENHANCED: Sử dụng unique constraint trên (post_signature, rounded_timestamp)
-        để tránh duplicate entries trong cùng khoảng thời gian (~1 phút)
+        FIX: Sử dụng exact timestamp (không round) để tránh collision.
+        ON CONFLICT DO UPDATE xử lý gracefully nếu có retry với cùng timestamp.
         
         Args:
             post_signature: Signature của post
-            log_timestamp_utc: Timestamp UTC (ISO format)
+            log_timestamp_utc: Timestamp UTC (ISO format) - exact timestamp
             like_count: Số lượng likes
             comment_count: Số lượng comments
             
         Returns:
             True nếu ghi thành công, False nếu có lỗi
         """
-        # Round timestamp to nearest minute để tránh duplicate khi retry
+        # ✅ FIX: Use exact timestamp - no rounding to prevent collision
+        # Each interaction gets unique timestamp for better chart granularity
         try:
             from datetime import datetime
+            # Validate timestamp format but don't round
             dt = datetime.fromisoformat(log_timestamp_utc.replace('Z', '+00:00'))
-            # Round to minute
-            dt = dt.replace(second=0, microsecond=0)
-            rounded_timestamp = dt.isoformat()
+            exact_timestamp = dt.isoformat()
         except Exception as e:
-            logger.warning("⚠️ Error rounding timestamp, using original: %s", e)
-            rounded_timestamp = log_timestamp_utc
+            logger.warning("⚠️ Error parsing timestamp, using original: %s", e)
+            exact_timestamp = log_timestamp_utc
         
-        # Use ON CONFLICT DO UPDATE to prevent duplicates
+        # Use ON CONFLICT DO UPDATE for retry safety
+        # If exact same timestamp (rare due to no rounding), update values
         sql = """
         INSERT INTO interactions (post_signature, log_timestamp_utc, like_count, comment_count)
         VALUES (%s, %s, %s, %s)
@@ -353,20 +375,42 @@ class DatabaseManager:
         VALUES (%s, %s, %s, %s)
         """
         
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    try:
-                        cursor.execute(sql, (post_signature, rounded_timestamp, like_count, comment_count))
-                    except psycopg2.errors.UndefinedObject:
-                        # Constraint chưa tồn tại, dùng fallback
-                        cursor.execute(fallback_sql, (post_signature, rounded_timestamp, like_count, comment_count))
-            
-            logger.debug("✅ Logged interaction: %s likes, %s comments for post %s...", like_count, comment_count, post_signature[:30])
-            return True
-        except Exception as e:
-            logger.error("❌ Database error logging interaction for post %s: %s", post_signature[:30], e, exc_info=False)
-            return False
+        # 🔄 FIX: Add retry logic với exponential backoff cho transient errors
+        max_retries = 3
+        retry_delay = 0.5  # Start with 500ms
+        
+        for attempt in range(max_retries):
+            try:
+                with self.get_connection() as conn:
+                    with conn.cursor() as cursor:
+                        try:
+                            cursor.execute(sql, (post_signature, exact_timestamp, like_count, comment_count))
+                        except psycopg2.errors.UndefinedObject:
+                            # Constraint chưa tồn tại, dùng fallback
+                            cursor.execute(fallback_sql, (post_signature, exact_timestamp, like_count, comment_count))
+                
+                logger.debug("✅ Logged interaction: %s likes, %s comments for post %s... at %s", like_count, comment_count, post_signature[:30], exact_timestamp)
+                return True
+                
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                # Transient errors - network hiccup, connection lost
+                if attempt < max_retries - 1:
+                    logger.warning("⚠️ Transient DB error (attempt %d/%d): %s - Retrying in %.1fs...", 
+                                 attempt + 1, max_retries, e, retry_delay)
+                    import time
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    logger.error("❌ DB error after %d retries for post %s: %s", max_retries, post_signature[:30], e)
+                    return False
+                    
+            except Exception as e:
+                # Non-transient errors - don't retry
+                logger.error("❌ Database error logging interaction for post %s: %s", post_signature[:30], e, exc_info=False)
+                return False
+        
+        return False
     
     def log_interactions_batch(self, interactions: List[Dict[str, Any]]) -> int:
         """
@@ -382,15 +426,15 @@ class DatabaseManager:
             return 0
         
         try:
-            # Round all timestamps
+            # ✅ FIX: Use exact timestamps (no rounding) to prevent collision
             processed_interactions = []
             for item in interactions:
                 try:
+                    # Validate timestamp format but don't round
                     dt = datetime.fromisoformat(item['log_timestamp_utc'].replace('Z', '+00:00'))
-                    dt = dt.replace(second=0, microsecond=0)
                     processed_interactions.append((
                         item['post_signature'],
-                        dt.isoformat(),
+                        dt.isoformat(),  # Exact timestamp
                         item['like_count'],
                         item['comment_count']
                     ))

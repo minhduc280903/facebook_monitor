@@ -127,11 +127,21 @@ class ManagedResource:
         return resource
     
     def calculate_success_rate(self):
-        """Recalculate success rate based on current stats."""
-        if self.total_tasks == 0:
+        """
+        Recalculate success rate based on current stats.
+        
+        ⚠️ THREAD-SAFETY NOTE: This method reads total_tasks and successful_tasks
+        which may be updated by other threads. For critical accuracy, caller should
+        hold appropriate locks. For metrics/monitoring, eventual consistency is acceptable.
+        """
+        # Read values atomically (Python GIL ensures single reads are atomic)
+        total = self.total_tasks
+        successful = self.successful_tasks
+        
+        if total == 0:
             self.success_rate = 1.0
         else:
-            self.success_rate = self.successful_tasks / self.total_tasks
+            self.success_rate = successful / total
         return self.success_rate
     
     def is_quarantined(self) -> bool:
@@ -625,81 +635,96 @@ class SessionManager:
             self._process_cooldowns()
             
             while time.time() - start_time < timeout:
-                # Try each available session with ROTATION
-                # Sort sessions by last_used_timestamp (least recently used first) for fair rotation
-                sorted_sessions = sorted(
-                    self.resource_pool.items(),
-                    key=lambda x: x[1].last_used_timestamp or datetime.min
-                )
-                
-                for session_name, session_resource in sorted_sessions:
-                    # Skip if in use or quarantined
-                    if session_resource.status == "IN_USE" or session_resource.is_quarantined():
-                        continue
+                # 🔒 FIX RACE CONDITION: Wrap entire checkout in atomic lock
+                with self.locks():
+                    # Reload from file to get latest status from other processes
+                    self._load_resources_to_memory()
                     
-                    # Skip if needs login or disabled
-                    if session_resource.status in ["NEEDS_LOGIN", "DISABLED"]:
-                        continue
+                    # Try each available session with ROTATION
+                    # Sort sessions by last_used_timestamp (least recently used first) for fair rotation
+                    sorted_sessions = sorted(
+                        self.resource_pool.items(),
+                        key=lambda x: x[1].last_used_timestamp or datetime.min
+                    )
                     
-                    try:
-                        # 🚀 SIMPLE: Lấy danh sách proxy READY
-                        ready_proxy_ids = [
-                            pid for pid, pres in proxy_manager.resource_pool.items()
-                            if pres.status == "READY" and pres.metadata.get("config")
-                        ]
-                        
-                        if not ready_proxy_ids:
-                            logger.debug(f"⚠️ No READY proxies available")
+                    for session_name, session_resource in sorted_sessions:
+                        # Re-check all availability conditions atomically
+                        if session_resource.status == "IN_USE":
+                            continue
+                        if session_resource.is_quarantined():
+                            continue
+                        if session_resource.status in ["NEEDS_LOGIN", "DISABLED"]:
                             continue
                         
-                        # Get proxy đã bind hoặc bind mới (tự động xử lý)
-                        bound_proxy_id = self.proxy_binder.get_proxy_for_session(
-                            session_name, ready_proxy_ids
-                        )
-                        
-                        if not bound_proxy_id:
-                            logger.debug(f"⚠️ Session {session_name}: binding failed")
+                        try:
+                            # 🚀 SIMPLE: Lấy danh sách proxy READY
+                            ready_proxy_ids = [
+                                pid for pid, pres in proxy_manager.resource_pool.items()
+                                if pres.status == "READY" and pres.metadata.get("config")
+                            ]
+                            
+                            if not ready_proxy_ids:
+                                logger.debug(f"⚠️ No READY proxies available")
+                                continue
+                            
+                            # Get proxy đã bind hoặc bind mới (tự động xử lý)
+                            bound_proxy_id = self.proxy_binder.get_proxy_for_session(
+                                session_name, ready_proxy_ids
+                            )
+                            
+                            if not bound_proxy_id:
+                                logger.debug(f"⚠️ Session {session_name}: binding failed")
+                                continue
+                            
+                            # Check proxy có READY không
+                            proxy_resource = proxy_manager.resource_pool.get(bound_proxy_id)
+                            if not proxy_resource:
+                                logger.warning(f"⚠️ Proxy {bound_proxy_id} not found")
+                                continue
+                            
+                            if proxy_resource.status != "READY":
+                                logger.debug(f"⚠️ Proxy {bound_proxy_id} not READY (status={proxy_resource.status})")
+                                continue
+                            
+                            if proxy_resource.is_quarantined():
+                                logger.debug(f"⚠️ Proxy {bound_proxy_id} quarantined")
+                                continue
+                            
+                            proxy_config = proxy_resource.metadata.get("config")
+                            if not proxy_config:
+                                logger.warning(f"⚠️ Proxy {bound_proxy_id} no config")
+                                continue
+                            
+                            # 🔥 FIX #2: AUTO-UNBIND if proxy repeatedly fails health checks
+                            # Check if proxy has consecutive failures
+                            if proxy_resource.consecutive_failures >= 2:
+                                logger.warning(f"🔓 Auto-unbinding session {session_name} from failing proxy {bound_proxy_id} ({proxy_resource.consecutive_failures} failures)")
+                                self.proxy_binder.unbind_session(session_name)
+                                # Try next session in the rotation
+                                continue
+                            
+                            # ✅ ATOMIC: Mark both session AND proxy as IN_USE within same lock
+                            session_resource.status = "IN_USE"
+                            session_resource.last_used_timestamp = datetime.now()
+                            
+                            proxy_resource.status = "IN_USE"
+                            proxy_resource.last_used_timestamp = datetime.now()
+                            
+                            # Write immediately to file so other processes see it
+                            self._sync_resources_to_file(force=True)
+                            
+                            # Return session + proxy
+                            proxy_config_copy = proxy_config.copy()
+                            proxy_config_copy["proxy_id"] = bound_proxy_id
+                            
+                            logger.info(f"✅ Checkout: {session_name} -> {bound_proxy_id}")
+                            return (session_name, proxy_config_copy)
+                            
+                        except Exception as e:
+                            logger.error(f"❌ Error binding session {session_name}: {e}")
                             continue
-                        
-                        # Check proxy có READY không
-                        proxy_resource = proxy_manager.resource_pool.get(bound_proxy_id)
-                        if not proxy_resource:
-                            logger.warning(f"⚠️ Proxy {bound_proxy_id} not found")
-                            continue
-                        
-                        if proxy_resource.status != "READY":
-                            logger.debug(f"⚠️ Proxy {bound_proxy_id} not READY (status={proxy_resource.status})")
-                            continue
-                        
-                        if proxy_resource.is_quarantined():
-                            logger.debug(f"⚠️ Proxy {bound_proxy_id} quarantined")
-                            continue
-                        
-                        proxy_config = proxy_resource.metadata.get("config")
-                        if not proxy_config:
-                            logger.warning(f"⚠️ Proxy {bound_proxy_id} no config")
-                            continue
-                        
-                        # ✅ ATOMICALLY mark session IN_USE (prevent race condition)
-                        if not self._atomic_try_mark_session_in_use(session_name):
-                            logger.debug(f"⚠️ Session {session_name} taken by another worker")
-                            continue
-                        
-                        # Mark proxy IN_USE
-                        proxy_resource.status = "IN_USE"
-                        proxy_resource.last_used_timestamp = datetime.now()
-                        
-                        # Return session + proxy
-                        proxy_config_copy = proxy_config.copy()
-                        proxy_config_copy["proxy_id"] = bound_proxy_id
-                        
-                        logger.info(f"✅ Checkout: {session_name} -> {bound_proxy_id}")
-                        return (session_name, proxy_config_copy)
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Error binding session {session_name}: {e}")
-                        continue
                 
+                # Sleep outside lock to avoid blocking other workers
                 time.sleep(1)
             
             logger.warning("⚠️ Could not bind any available session with proxy")
@@ -1327,6 +1352,25 @@ class SessionManager:
             elif outcome == 'failure':
                 resource.consecutive_failures += 1
                 logger.debug(f"❌ Failure reported for {session_name} (consecutive: {resource.consecutive_failures})")
+                
+                # 🔥 FIX #4: CIRCUIT BREAKER - Unbind proxy after repeated failures
+                # This breaks the error loop between session and bad proxy
+                if resource.consecutive_failures >= 3:
+                    logger.critical(f"🔌 CIRCUIT BREAKER: Session {session_name} has {resource.consecutive_failures} consecutive failures")
+                    # Unbind from current proxy to allow re-assignment
+                    try:
+                        self.proxy_binder.unbind_session(session_name)
+                        logger.warning(f"🔓 Circuit breaker unbound session {session_name} to break error loop")
+                        
+                        # 🔥 CRITICAL FIX: Reset failures to allow session recovery
+                        resource.consecutive_failures = 0
+                        logger.info(f"♻️ Reset consecutive failures for {session_name} after circuit break")
+                        
+                        # Persist immediately to prevent loss on crash
+                        self._sync_resources_to_file()
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Failed to unbind session in circuit breaker: {e}")
             
             # Recalculate success rate
             resource.calculate_success_rate()
@@ -1534,6 +1578,193 @@ class SessionManager:
                     })
             
             return quarantined
+    
+    def auto_cleanup_stuck_sessions(self, timeout_minutes: int = 30) -> int:
+        """
+        🔥 AUTO CLEANUP: Tự động phát hiện và giải phóng sessions bị stuck
+        
+        Một session được coi là "stuck" nếu:
+        - Status = IN_USE
+        - last_used_timestamp > timeout_minutes
+        
+        Args:
+            timeout_minutes: Số phút timeout để coi session là stuck
+            
+        Returns:
+            Số sessions đã được giải phóng
+        """
+        released_count = 0
+        current_time = datetime.now()
+        timeout_delta = timedelta(minutes=timeout_minutes)
+        
+        with self.locks():
+            for session_name, resource in self.resource_pool.items():
+                # Check if session is stuck
+                if resource.status == "IN_USE":
+                    # If no last_used_timestamp, use created_at
+                    check_time = resource.last_used_timestamp or resource.created_at
+                    
+                    if check_time:
+                        time_in_use = current_time - check_time
+                        
+                        if time_in_use > timeout_delta:
+                            # Session is stuck! Release it
+                            logger.warning(
+                                f"🚨 STUCK SESSION DETECTED: {session_name} has been IN_USE for "
+                                f"{time_in_use.total_seconds()/60:.1f} minutes. Releasing..."
+                            )
+                            
+                            resource.status = "READY"
+                            resource.last_used_timestamp = current_time
+                            released_count += 1
+                            
+                            logger.info(f"✅ Released stuck session: {session_name}")
+            
+            if released_count > 0:
+                self._sync_resources_to_file(force=True)
+                logger.info(f"🧹 Auto-cleanup released {released_count} stuck sessions")
+            
+            return released_count
+    
+    def get_in_use_sessions_info(self) -> List[Dict[str, Any]]:
+        """
+        Lấy thông tin chi tiết về các sessions đang IN_USE
+        Hữu ích cho monitoring và debugging
+        
+        Returns:
+            List thông tin các sessions IN_USE
+        """
+        with self.lock:
+            in_use_sessions = []
+            current_time = datetime.now()
+            
+            for resource in self.resource_pool.values():
+                if resource.status == "IN_USE":
+                    check_time = resource.last_used_timestamp or resource.created_at
+                    time_in_use = None
+                    
+                    if check_time:
+                        time_in_use = (current_time - check_time).total_seconds() / 60  # minutes
+                    
+                    in_use_sessions.append({
+                        "session_name": resource.id,
+                        "role": resource.role.value,
+                        "last_used": check_time.isoformat() if check_time else None,
+                        "time_in_use_minutes": round(time_in_use, 2) if time_in_use else None,
+                        "total_tasks": resource.total_tasks,
+                        "success_rate": resource.success_rate,
+                        "consecutive_failures": resource.consecutive_failures
+                    })
+            
+            return in_use_sessions
+    
+    def health_check_sessions(self) -> Dict[str, Any]:
+        """
+        🏥 HEALTH CHECK: Kiểm tra sức khỏe toàn bộ session pool
+        
+        Returns:
+            Dict với thông tin health check và recommendations
+        """
+        with self.lock:
+            stats = self.get_stats()
+            in_use_info = self.get_in_use_sessions_info()
+            quarantined_info = self.get_quarantined_sessions()
+            
+            # Calculate health score (0-100)
+            health_score = 100
+            warnings = []
+            recommendations = []
+            
+            # Check 1: Too many sessions stuck in IN_USE
+            stuck_sessions = [s for s in in_use_info if s.get("time_in_use_minutes", 0) > 15]
+            if stuck_sessions:
+                health_score -= 20
+                warnings.append(f"{len(stuck_sessions)} sessions stuck IN_USE for >15 minutes")
+                recommendations.append("Run auto_cleanup_stuck_sessions()")
+            
+            # Check 2: Too many quarantined sessions
+            if stats['quarantined'] > stats['total'] * 0.3:  # More than 30% quarantined
+                health_score -= 25
+                warnings.append(f"High quarantine rate: {stats['quarantined']}/{stats['total']} sessions")
+                recommendations.append("Investigate and fix underlying issues causing failures")
+            
+            # Check 3: No ready sessions available
+            if stats['ready'] == 0:
+                health_score -= 30
+                warnings.append("No READY sessions available - system may be deadlocked")
+                recommendations.append("URGENT: Run reset_all_sessions() or auto_cleanup_stuck_sessions()")
+            
+            # Check 4: Sessions requiring login
+            if stats['needs_login'] > stats['total'] * 0.2:  # More than 20% need login
+                health_score -= 15
+                warnings.append(f"{stats['needs_login']} sessions need re-login")
+                recommendations.append("Re-login required sessions using auto_login.py")
+            
+            # Check 5: Low average success rate
+            if stats['average_success_rate'] < 0.5:  # Below 50%
+                health_score -= 10
+                warnings.append(f"Low average success rate: {stats['average_success_rate']:.1%}")
+                recommendations.append("Review scraping logic and error handling")
+            
+            health_status = "HEALTHY" if health_score >= 80 else "DEGRADED" if health_score >= 50 else "CRITICAL"
+            
+            return {
+                "health_status": health_status,
+                "health_score": max(0, health_score),
+                "timestamp": datetime.now().isoformat(),
+                "stats": stats,
+                "warnings": warnings,
+                "recommendations": recommendations,
+                "in_use_sessions": in_use_info,
+                "quarantined_sessions": quarantined_info,
+                "stuck_sessions_count": len(stuck_sessions) if stuck_sessions else 0
+            }
+    
+    def auto_recovery(self, max_stuck_minutes: int = 30) -> Dict[str, Any]:
+        """
+        🚑 AUTO RECOVERY: Tự động phục hồi hệ thống từ trạng thái lỗi
+        
+        Thực hiện các actions:
+        1. Release stuck sessions
+        2. Process cooldowns
+        3. Return health status
+        
+        Args:
+            max_stuck_minutes: Số phút để coi session là stuck
+            
+        Returns:
+            Dict với kết quả recovery
+        """
+        logger.info("🚑 Starting auto-recovery process...")
+        
+        # Step 1: Release stuck sessions
+        released = self.auto_cleanup_stuck_sessions(timeout_minutes=max_stuck_minutes)
+        
+        # Step 2: Process cooldowns
+        cooldown_released = self.check_cooldowns()
+        
+        # Step 3: Get health status
+        health = self.health_check_sessions()
+        
+        recovery_result = {
+            "timestamp": datetime.now().isoformat(),
+            "actions_taken": {
+                "stuck_sessions_released": released,
+                "cooldowns_processed": cooldown_released
+            },
+            "health_after_recovery": health
+        }
+        
+        if released > 0 or cooldown_released > 0:
+            logger.info(
+                f"✅ Auto-recovery completed: "
+                f"Released {released} stuck sessions, "
+                f"Processed {cooldown_released} cooldowns"
+            )
+        else:
+            logger.info("✅ Auto-recovery completed: No actions needed")
+        
+        return recovery_result
 
 
 # Test functions
