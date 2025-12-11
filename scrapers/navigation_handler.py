@@ -47,12 +47,17 @@ class NavigationHandler:
         
         logger.debug("📜 Cuộn trang humanized để load posts...")
         
-        # Random number of scrolls
-        scroll_count = random.randint(2, 4)
+        # Random number of scrolls - Pareto distribution (long tail)
+        # Most sessions: 2-4 scrolls, some: 5-10 scrolls (natural variance)
+        scroll_count = min(int(random.paretovariate(1.8)) + 2, 10)
         
         for i in range(scroll_count):
-            # Random scroll distance
-            scroll_distance = random.randint(800, 2000)
+            # Random scroll distance - Pareto distribution (natural human scrolling)
+            # 70% small-medium (300-800px), 30% large (800-1500px)
+            if random.random() < 0.7:
+                scroll_distance = random.randint(300, 800)
+            else:
+                scroll_distance = random.randint(800, 1500)
             
             # Move mouse to random position before scrolling
             await self._random_mouse_movement()
@@ -60,15 +65,19 @@ class NavigationHandler:
             # Scroll with humanized pattern
             await self.page.mouse.wheel(0, scroll_distance)
             
-            # Random delay between scrolls
-            delay = random.uniform(self.min_scroll_delay, self.max_scroll_delay)
+            # ⚡ PARETO DELAY (anti-detection): Long-tail distribution
+            # 80% delays: 0.5-2s (fast scrolling)
+            # 20% delays: 2-10s (reading/pausing)
+            delay = min(random.paretovariate(1.5), 10.0)
             await asyncio.sleep(delay)
             
-            logger.debug(f"📜 Cuộn humanized lần {i+1}/{scroll_count} - {scroll_distance}px")
+            logger.debug(f"📜 Cuộn humanized lần {i+1}/{scroll_count} - {scroll_distance}px, delay {delay:.1f}s")
             
-            # Occasional pause to simulate reading
-            if random.random() < 0.3:  # 30% chance
-                reading_pause = random.uniform(0.5, 2.0)
+            # ✅ ANTI-DETECTION: Reading pauses - PARETO DISTRIBUTION (more natural)
+            # Increased to 50% chance and longer duration for more human-like behavior
+            if random.random() < 0.5:
+                # Pareto: Most 3-8s, some 8-30s (deep reading)
+                reading_pause = min(random.paretovariate(1.8) + 3.0, 30.0)  # Increased from 1.5-15s
                 await asyncio.sleep(reading_pause)
                 logger.debug(f"📖 Mô phỏng đọc trong {reading_pause:.1f}s")    
     async def find_post_elements(self, content_extractor=None) -> List:

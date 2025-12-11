@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Session Manager for Facebook Post Monitor - Enterprise Edition Phase 3.0
-Quản lý pool sessions đã đăng nhập để workers sử dụng chung
+Quản lý pool sessions done: đăng nhập để workers sử dụng chung
 
 Mục đích:
-- Quản lý pool các profile Facebook đã đăng nhập
+- Quản lý pool các profile Facebook done: đăng nhập
 - Thread-safe checkout/checkin sessions
 - Tránh multiple workers sử dụng cùng session
 - Giải quyết vấn đề checkpoint bằng session reuse
@@ -130,7 +130,7 @@ class ManagedResource:
         """
         Recalculate success rate based on current stats.
         
-        ⚠️ THREAD-SAFETY NOTE: This method reads total_tasks and successful_tasks
+        [WARN] THREAD-SAFETY NOTE: This method reads total_tasks and successful_tasks
         which may be updated by other threads. For critical accuracy, caller should
         hold appropriate locks. For metrics/monitoring, eventual consistency is acceptable.
         """
@@ -183,19 +183,27 @@ class SessionManager:
     - NEEDS_LOGIN: Session cần đăng nhập lại
     """
     
-    def __init__(self, status_file: str = "session_status.json", sessions_dir: str = "sessions"):
+    def __init__(self, status_file: str = "session_status.json", sessions_dir: str = "sessions", db_manager=None):
         """
-        Khởi tạo SessionManager với cross-process file locking và session-proxy binding
+        Initialize SessionManager với cross-process file locking và session-proxy binding
         
         Args:
             status_file: File JSON theo dõi trạng thái sessions
             sessions_dir: Thư mục chứa các session folders
+            db_manager: DatabaseManager instance (optional, for SessionProxyBinder migration)
         """
         from config import settings
         
         self.status_file = status_file
         self.sessions_dir = sessions_dir
         self.lock = threading.Lock()  # Thread-safe access
+        
+        # ✅ FIX: Initialize database manager for SessionProxyBinder
+        if db_manager is None:
+            from .database_manager import DatabaseManager
+            self.db = DatabaseManager()
+        else:
+            self.db = db_manager
         
         # Load performance thresholds from config instead of hard-coded values
         resource_config = settings.resource_management
@@ -207,34 +215,34 @@ class SessionManager:
         # Resource pool (in-memory cache)
         self.resource_pool: Dict[str, ManagedResource] = {}
         
-        # 🔧 PERFORMANCE OPTIMIZATION: Batch file writes to reduce I/O (from config)
+        # [FIX] PERFORMANCE OPTIMIZATION: Batch file writes to reduce I/O (from config)
         self.pending_file_sync = False
         self.last_file_sync_time = datetime.now()
         self.file_sync_interval_seconds = resource_config.file_sync_interval_seconds
         self.file_sync_change_threshold = resource_config.file_sync_change_threshold
         self.changes_since_last_sync = 0
         
-        # 🔗 PRODUCTION FIX: Session-Proxy binding
+        # 🔗 PRODUCTION FIX: Session-Proxy binding with database for migration
         from .session_proxy_binder import SessionProxyBinder
-        self.proxy_binder = SessionProxyBinder("session_proxy_bindings.json")
+        self.proxy_binder = SessionProxyBinder("session_proxy_bindings.json", db_manager=self.db)
         
-        # 🔧 PRODUCTION FIX: Cross-process file locking
+        # [FIX] PRODUCTION FIX: Cross-process file locking
         if FILELOCK_AVAILABLE:
             self.file_lock_path = self.status_file + ".lock"
             self.file_lock = FileLock(self.file_lock_path)
-            logger.info("🔒 Cross-process file locking enabled")
+            logger.info("[LOCK] Cross-process file locking enabled")
         else:
             self.file_lock = None
-            logger.warning("⚠️ FileLock not available - only thread-safe within process")
+            logger.warning("[WARN] FileLock not available - only thread-safe within process")
         
         # Ensure directories exist
         self._ensure_structure()
         
-        logger.info(f"🔐 SessionManager khởi tạo: {status_file}")
+        logger.info(f"[SECURE] SessionManager initialized: {status_file}")
         logger.info(f"📁 Sessions directory: {sessions_dir}")
         logger.info("🔗 Session-Proxy binding enabled")    
     def _ensure_structure(self):
-        """Đảm bảo cấu trúc thư mục và file tồn tại"""
+        """Đảm bảo cấu trúc thư mục và file exists"""
         # Tạo sessions directory nếu chưa có
         if not os.path.exists(self.sessions_dir):
             os.makedirs(self.sessions_dir)
@@ -276,6 +284,9 @@ class SessionManager:
         """Tạo status file ban đầu với sessions được phát hiện."""
         initial_resources = {}
         
+        # [ART] IMPORT: GenLogin-style fingerprint generator
+        from utils.browser_config import generate_session_fingerprint
+        
         # Tìm tất cả session folders có sẵn
         try:
             for item in os.listdir(self.sessions_dir):
@@ -294,12 +305,28 @@ class SessionManager:
                         resource.status = "READY"
                     else:
                         resource.status = "NEEDS_LOGIN"
+                    
+                    # [ART] GenLogin/GPM: Generate unique fingerprint per session
+                    # ✅ EVOLUTION: Calculate days since creation for fingerprint drift
+                    days_since_creation = 0
+                    if resource.created_at:
+                        days_since_creation = (datetime.now() - resource.created_at).days
+                    
+                    resource.metadata["fingerprint"] = generate_session_fingerprint(
+                        item, 
+                        days_since_creation=days_since_creation
+                    )
+                    logger.info(f"[ART] Generated fingerprint for session: {item} (age: {days_since_creation} days)")
+                    
                     initial_resources[item] = resource.to_dict()
         except OSError:
-            logger.warning("⚠️ Không thể scan sessions directory")
+            logger.warning("[WARN] Cannot scan sessions directory")
         
         # Nếu không có session nào, tạo template với role examples
         if not initial_resources:
+            # [ART] IMPORT: GenLogin-style fingerprint generator
+            from utils.browser_config import generate_session_fingerprint
+            
             template_accounts = [
                 ("account_discovery_1", AccountRole.DISCOVERY),
                 ("account_discovery_2", AccountRole.DISCOVERY), 
@@ -311,6 +338,8 @@ class SessionManager:
             for account_id, role in template_accounts:
                 resource = ManagedResource(account_id, "session", role)
                 resource.status = "NEEDS_LOGIN"
+                # [ART] GenLogin/GPM: Generate unique fingerprint per session (new session = 0 days)
+                resource.metadata["fingerprint"] = generate_session_fingerprint(account_id, days_since_creation=0)
                 initial_resources[account_id] = resource.to_dict()
             logger.info("📝 Tạo template session status - cần setup sessions")
         
@@ -332,6 +361,9 @@ class SessionManager:
                         # Found new session folder not in status file
                         logger.info(f"📁 Discovered new session folder: {item}")
                         
+                        # [ART] IMPORT: GenLogin-style fingerprint generator
+                        from utils.browser_config import generate_session_fingerprint
+                        
                         # Auto-assign role based on naming or default to MIXED
                         role = AccountRole.MIXED
                         if "discovery" in item.lower():
@@ -343,10 +375,15 @@ class SessionManager:
                         # Check if valid session folder
                         if self._is_valid_session_folder(session_path):
                             resource.status = "READY"
-                            logger.info(f"✅ Session {item} is valid and READY")
+                            logger.info(f"[OK] Session {item} is valid and READY")
                         else:
                             resource.status = "NEEDS_LOGIN"
-                            logger.warning(f"⚠️ Session {item} needs login")
+                            logger.warning(f"[WARN] Session {item} needs login")
+                        
+                        # [ART] GenLogin/GPM: Generate unique fingerprint for new session
+                        # New session = 0 days old
+                        resource.metadata["fingerprint"] = generate_session_fingerprint(item, days_since_creation=0)
+                        logger.info(f"[ART] Generated fingerprint for new session: {item}")
                         
                         existing_status[item] = resource.to_dict()
                         updated = True
@@ -357,7 +394,7 @@ class SessionManager:
                 session_path = os.path.join(self.sessions_dir, session_id)
                 if not os.path.exists(session_path) or not os.path.isdir(session_path):
                     sessions_to_remove.append(session_id)
-                    logger.warning(f"⚠️ Session folder not found: {session_id}")
+                    logger.warning(f"[WARN] Session folder not found: {session_id}")
             
             for session_id in sessions_to_remove:
                 del existing_status[session_id]
@@ -367,15 +404,19 @@ class SessionManager:
             # Update file if changes were made
             if updated:
                 self._write_status_file(existing_status)
-                logger.info(f"🔄 Synced session status file: {len(existing_status)} sessions")
+                logger.info(f"[RELOAD] Synced session status file: {len(existing_status)} sessions")
             else:
                 logger.debug("💫 Session status file already in sync")
                 
         except Exception as e:
-            logger.error(f"❌ Error syncing session folders: {e}")
+            logger.error(f"[ERROR] Error syncing session folders: {e}")
     
     def _load_resources_to_memory(self):
-        """Load tất cả resources từ file vào memory cache."""
+        """
+        Load tất cả resources từ file vào memory cache.
+        
+        ⚠️ CALLER MUST HOLD LOCK! This method does NOT acquire locks.
+        """
         status_data = self._read_status_file()
         self.resource_pool.clear()
         
@@ -384,30 +425,39 @@ class SessionManager:
                 resource = ManagedResource.from_dict(resource_data)
                 self.resource_pool[resource_id] = resource
             except Exception as e:
-                logger.warning(f"⚠️ Lỗi load resource {resource_id}: {e}")
+                logger.warning(f"[WARN] Error load resource {resource_id}: {e}")
                 # Fallback to basic resource with MIXED role
                 resource = ManagedResource(resource_id, "session", AccountRole.MIXED)
                 if isinstance(resource_data, dict):
                     resource.status = resource_data.get("status", "NEEDS_LOGIN")
                 self.resource_pool[resource_id] = resource
         
-        # ✅ REDUCED LOG LEVEL: This is called frequently in atomic lock during checkout
+        # [OK] REDUCED LOG LEVEL: This is called frequently in atomic lock during checkout
         # Change from INFO to DEBUG to avoid log spam with multiple workers
-        logger.debug(f"📋 Loaded {len(self.resource_pool)} resources to memory")
+        logger.debug(f"[INFO] Loaded {len(self.resource_pool)} resources to memory")
     
     def _read_status_file(self) -> Dict[str, Any]:
         """
-        Đọc session status từ file (thread-safe)
+        Đọc session status từ file với ERROR RECOVERY strategy
+        
+        ✅ CRITICAL FIX: Proper error handling với backup restore
+        ✅ CRITICAL FIX: Validation để detect corruption sớm
         
         Returns:
             Dict chứa resource data
         """
+        import shutil
+        
         try:
             with open(self.status_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 
-                # ⚡ MIGRATION: Convert old format to new ManagedResource format
-                # ✅ FIX: Only migrate if TRULY old format (missing 'type' field)
+                # ✅ FIX #2: Validate data integrity
+                if not isinstance(data, dict):
+                    raise ValueError(f"Invalid status file format: expected dict, got {type(data)}")
+                
+                # [FAST] MIGRATION: Convert old format to new ManagedResource format
+                # [OK] FIX: Only migrate if TRULY old format (missing 'type' field)
                 if data:
                     first_value = list(data.values())[0]
                     # Old format: string status OR dict without 'type' field
@@ -423,17 +473,58 @@ class SessionManager:
                         if migrated:
                             self._write_status_file(migrated)
                             return migrated
-                    # Else: New format with 'type' field → no migration needed
+                    # Else: New format with 'type' field -> no migration needed
                 
                 return data
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logger.error(f"❌ Lỗi đọc session status: {e}")
+                
+        except FileNotFoundError:
+            # ✅ OK: File doesn't exist yet (first run)
+            logger.warning(f"[WARN] Status file not found: {self.status_file} (will be created)")
             return {}
+            
+        except json.JSONDecodeError as e:
+            # ❌ CRITICAL: File is corrupted!
+            logger.error(f"[CRITICAL] Status file corrupted: {e}")
+            
+            # ✅ FIX #2: Try to restore from backup
+            backup_path = self.status_file + ".backup"
+            if os.path.exists(backup_path):
+                try:
+                    logger.info(f"[RECOVERY] Attempting restore from backup: {backup_path}")
+                    
+                    # Validate backup before restore
+                    with open(backup_path, 'r', encoding='utf-8') as f:
+                        backup_data = json.load(f)
+                        if not isinstance(backup_data, dict):
+                            raise ValueError("Backup file also corrupted")
+                    
+                    # Backup is valid, restore it
+                    shutil.copy2(backup_path, self.status_file)
+                    logger.info("[RECOVERY] ✅ Successfully restored from backup")
+                    
+                    return backup_data
+                    
+                except Exception as backup_error:
+                    logger.error(f"[RECOVERY] ❌ Backup restore failed: {backup_error}")
+            else:
+                logger.error("[RECOVERY] ❌ No backup file available")
+            
+            # ✅ FIX #2: Raise exception instead of silent failure
+            # This forces calling code to handle the critical error properly
+            raise RuntimeError(
+                f"Status file corrupted and recovery failed. "
+                f"Manual intervention required: {self.status_file}"
+            )
+            
+        except Exception as e:
+            # Other unexpected errors
+            logger.error(f"[ERROR] Unexpected error reading status file: {e}")
+            raise
     
     def _migrate_old_format(self, old_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Migrate old session format to new ManagedResource format."""
         try:
-            logger.info("🔄 Migrating to new ManagedResource format")
+            logger.info("[RELOAD] Migrating to new ManagedResource format")
             migrated_data = {}
             
             for session_name, session_info in old_data.items():
@@ -463,25 +554,64 @@ class SessionManager:
                 
                 migrated_data[session_name] = resource.to_dict()
             
-            logger.info(f"✅ Migrated {len(migrated_data)} sessions to new format")
+            logger.info(f"[OK] Migrated {len(migrated_data)} sessions to new format")
             return migrated_data
             
         except Exception as e:
-            logger.error(f"❌ Migration failed: {e}")
+            logger.error(f"[ERROR] Migration failed: {e}")
             return None
     
     def _write_status_file(self, status_data: Dict[str, Any]):
         """
-        Ghi session status vào file (thread-safe)
+        Ghi session status vào file với ATOMIC WRITE + BACKUP strategy
+        
+        ✅ CRITICAL FIX: Atomic write prevents corruption on crash
+        ✅ CRITICAL FIX: Backup enables recovery from corruption
         
         Args:
             status_data: Dict chứa resource data
         """
+        import tempfile
+        import shutil
+        
         try:
-            with open(self.status_file, 'w', encoding='utf-8') as f:
-                json.dump(status_data, f, indent=2, ensure_ascii=False)
+            # ✅ FIX #6: Backup current file trước khi write (nếu exists)
+            backup_path = self.status_file + ".backup"
+            if os.path.exists(self.status_file):
+                try:
+                    shutil.copy2(self.status_file, backup_path)
+                except Exception as e:
+                    logger.warning(f"[WARN] Cannot create backup: {e}")
+            
+            # ✅ FIX #1: ATOMIC WRITE - Write to temp file first
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=os.path.dirname(self.status_file) or '.',
+                prefix='.tmp_status_',
+                suffix='.json'
+            )
+            
+            try:
+                # Write to temp file
+                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                    json.dump(status_data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())  # Force write to disk
+                
+                # ✅ ATOMIC: Rename is atomic on all modern OS
+                # If crash happens before rename, original file is intact
+                # If crash happens during rename, OS guarantees atomicity
+                os.replace(temp_path, self.status_file)
+                
+                logger.debug(f"📝 Atomic write: {len(status_data)} resources to {self.status_file}")
+                
+            except Exception as e:
+                # Clean up temp file if write failed
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise
+                
         except Exception as e:
-            logger.error(f"❌ Lỗi ghi session status: {e}")
+            logger.error(f"[ERROR] Error writing session status: {e}")
             raise
     
     def _execute_with_locks(self, operation_func):
@@ -520,7 +650,7 @@ class SessionManager:
 
     def _atomic_try_mark_session_in_use(self, session_name: str) -> bool:
         """
-        ✅ FIX RACE CONDITION: Atomically check if session is available and mark as IN_USE.
+        [OK] FIX RACE CONDITION: Atomically check if session is available and mark as IN_USE.
         
         CRITICAL: This method uses CROSS-PROCESS FileLock to prevent multiple Celery workers
         from checking out the same session simultaneously.
@@ -531,7 +661,7 @@ class SessionManager:
         Returns:
             True if successfully marked as IN_USE, False if already taken or unavailable
         """
-        # 🔒 CRITICAL: Use FileLock for cross-process atomicity (not just threading.Lock!)
+        # [LOCK] CRITICAL: Use FileLock for cross-process atomicity (not just threading.Lock!)
         with self.locks():
             # Reload from file to get latest status from other processes
             self._load_resources_to_memory()
@@ -561,6 +691,8 @@ class SessionManager:
     def _sync_resources_to_file(self, force: bool = False):
         """
         Sync in-memory resources back to file with batching optimization.
+        
+        ⚠️ CALLER MUST HOLD LOCK! This method does NOT acquire locks.
         
         Args:
             force: If True, sync immediately regardless of batching rules
@@ -595,7 +727,7 @@ class SessionManager:
         """
         Intelligent session checkout với performance-based selection
         
-        ⚠️ DEPRECATED: Use checkout_session_with_proxy() for production
+        [WARN] DEPRECATED: Use checkout_session_with_proxy() for production
         This method is maintained for backward compatibility and unit testing
         
         Args:
@@ -631,7 +763,7 @@ class SessionManager:
 
     def checkout_session_with_proxy(self, proxy_manager, timeout: int = 30) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
-        Checkout session cùng với proxy đã được bind - PERSISTENT BINDING
+        Checkout session cùng với proxy done: được bind - PERSISTENT BINDING
         
         Args:
             proxy_manager: Instance của ProxyManager
@@ -643,13 +775,18 @@ class SessionManager:
         import os
         
         try:
+            logger.info(f"[DEBUG] checkout_session_with_proxy called, timeout={timeout}")
+            logger.info(f"[DEBUG] Total sessions in pool: {len(self.resource_pool)}")
+            for sid, res in self.resource_pool.items():
+                logger.info(f"[DEBUG] Session {sid}: status={res.status}, quarantined={res.is_quarantined()}")
+            
             start_time = time.time()
             
             # Process cooldowns first
             self._process_cooldowns()
             
             while time.time() - start_time < timeout:
-                # 🔒 FIX RACE CONDITION: Wrap entire checkout in atomic lock
+                # [LOCK] FIX RACE CONDITION: Wrap entire checkout in atomic lock
                 with self.locks():
                     # Reload from file to get latest status from other processes
                     self._load_resources_to_memory()
@@ -671,53 +808,57 @@ class SessionManager:
                             continue
                         
                         try:
-                            # 🚀 SIMPLE: Lấy danh sách proxy READY
+                            # [LAUNCH] SIMPLE: Lấy danh sách proxy READY
                             ready_proxy_ids = [
                                 pid for pid, pres in proxy_manager.resource_pool.items()
                                 if pres.status == "READY" and pres.metadata.get("config")
                             ]
                             
+                            logger.info(f"[DEBUG] Session {session_name}: ready_proxy_ids={ready_proxy_ids}")
+                            
                             if not ready_proxy_ids:
-                                logger.debug(f"⚠️ No READY proxies available")
+                                logger.debug(f"[WARN] No READY proxies available")
                                 continue
                             
-                            # Get proxy đã bind hoặc bind mới (tự động xử lý)
+                            # Get proxy done: bind hoặc bind mới (tự động xử lý)
                             bound_proxy_id = self.proxy_binder.get_proxy_for_session(
                                 session_name, ready_proxy_ids
                             )
                             
                             if not bound_proxy_id:
-                                logger.debug(f"⚠️ Session {session_name}: binding failed")
+                                logger.debug(f"[WARN] Session {session_name}: binding failed")
                                 continue
+                            
+                            logger.info(f"[DEBUG] Session {session_name}: bound_proxy_id={bound_proxy_id}")
                             
                             # Check proxy có READY không
                             proxy_resource = proxy_manager.resource_pool.get(bound_proxy_id)
                             if not proxy_resource:
-                                logger.warning(f"⚠️ Proxy {bound_proxy_id} not found")
+                                logger.warning(f"[WARN] Proxy {bound_proxy_id} not found")
                                 continue
                             
                             if proxy_resource.status != "READY":
-                                logger.debug(f"⚠️ Proxy {bound_proxy_id} not READY (status={proxy_resource.status})")
+                                logger.debug(f"[WARN] Proxy {bound_proxy_id} not READY (status={proxy_resource.status})")
                                 continue
                             
                             if proxy_resource.is_quarantined():
-                                logger.debug(f"⚠️ Proxy {bound_proxy_id} quarantined")
+                                logger.debug(f"[WARN] Proxy {bound_proxy_id} quarantined")
                                 continue
                             
                             proxy_config = proxy_resource.metadata.get("config")
                             if not proxy_config:
-                                logger.warning(f"⚠️ Proxy {bound_proxy_id} no config")
+                                logger.warning(f"[WARN] Proxy {bound_proxy_id} no config")
                                 continue
                             
-                            # 🔥 FIX #2: AUTO-UNBIND if proxy repeatedly fails health checks
+                            # [LOCK] PERMANENT BINDING POLICY: NEVER unbind!
                             # Check if proxy has consecutive failures
                             if proxy_resource.consecutive_failures >= 2:
-                                logger.warning(f"🔓 Auto-unbinding session {session_name} from failing proxy {bound_proxy_id} ({proxy_resource.consecutive_failures} failures)")
-                                self.proxy_binder.unbind_session(session_name)
-                                # Try next session in the rotation
+                                logger.warning(f"[PAUSE] Proxy {bound_proxy_id} has {proxy_resource.consecutive_failures} failures - SKIP session {session_name}")
+                                logger.info(f"[LOCK] PERMANENT BINDING: {session_name} -> {bound_proxy_id} (waiting for proxy recovery)")
+                                # [OK] SKIP this session (do NOT unbind, do NOT try next)
                                 continue
                             
-                            # ✅ ATOMIC: Mark both session AND proxy as IN_USE within same lock
+                            # [OK] ATOMIC: Mark both session AND proxy as IN_USE within same lock
                             session_resource.status = "IN_USE"
                             session_resource.last_used_timestamp = datetime.now()
                             
@@ -731,21 +872,21 @@ class SessionManager:
                             proxy_config_copy = proxy_config.copy()
                             proxy_config_copy["proxy_id"] = bound_proxy_id
                             
-                            logger.info(f"✅ Checkout: {session_name} -> {bound_proxy_id}")
+                            logger.info(f"[OK] Checkout: {session_name} -> {bound_proxy_id}")
                             return (session_name, proxy_config_copy)
                             
                         except Exception as e:
-                            logger.error(f"❌ Error binding session {session_name}: {e}")
+                            logger.error(f"[ERROR] Error binding session {session_name}: {e}")
                             continue
                 
                 # Sleep outside lock to avoid blocking other workers
                 time.sleep(1)
             
-            logger.warning("⚠️ Could not bind any available session with proxy")
+            logger.warning("[WARN] Could not bind any available session with proxy")
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error in session-proxy checkout: {e}")
+            logger.error(f"[ERROR] Error in session-proxy checkout: {e}")
             return None
     
     def _checkout_session_with_bound_proxy(self, proxy_manager) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -758,14 +899,20 @@ class SessionManager:
             for session_name, resource in self.resource_pool.items():
                 if resource.status == "READY" and not resource.is_quarantined():
                     available_sessions.append(session_name)
+                    logger.info(f"[DEBUG] Session {session_name} is available: status={resource.status}, quarantined={resource.is_quarantined()}")
+                else:
+                    logger.info(f"[DEBUG] Session {session_name} NOT available: status={resource.status}, quarantined={resource.is_quarantined()}")
+            
+            logger.info(f"[DEBUG] Total available sessions: {available_sessions}")
             
             if not available_sessions:
+                logger.warning("[WARN] No ready sessions available")
                 return None
             
             # Get available proxies
             proxy_stats = proxy_manager.get_stats()
             if proxy_stats['ready'] == 0:
-                logger.warning("⚠️ No ready proxies available for session binding")
+                logger.warning("[WARN] No ready proxies available for session binding")
                 return None
             
             # Try each available session to find one that can get a proxy
@@ -781,31 +928,20 @@ class SessionManager:
                                 proxy_config["proxy_id"] = proxy_id  # Add proxy_id for health check
                                 
                                 # Check if proxy recently passed health check (within last 5 minutes)
-                                last_checked = proxy_resource.metadata.get("last_checked")
-                                if last_checked:
-                                    try:
-                                        from datetime import datetime, timedelta
-                                        last_check_time = datetime.fromisoformat(last_checked)
-                                        if datetime.now() - last_check_time < timedelta(minutes=5):
-                                            # Recently verified, trust it
-                                            available_proxy_ids.append(proxy_id)
-                                            continue
-                                    except (ValueError, TypeError) as e:
-                                        logger.debug(f"Failed to parse last_checked timestamp for proxy {proxy_id}: {e}")
-                                        pass
-                                
-                                # Run health check (sync version)
                                 if proxy_manager.health_check_proxy(proxy_config):
                                     # Update last_checked timestamp to cache result
                                     proxy_resource.metadata["last_checked"] = datetime.now().isoformat()
                                     available_proxy_ids.append(proxy_id)
-                                    logger.debug(f"✅ Proxy {proxy_id} verified healthy")
+                                    logger.debug(f"[OK] Proxy {proxy_id} verified healthy")
                                 else:
-                                    logger.warning(f"⚠️ Proxy {proxy_id} failed health check, skipping")
+                                    logger.warning(f"[WARN] Proxy {proxy_id} failed health check, skipping")
                             else:
-                                logger.warning(f"⚠️ Proxy {proxy_id} has no config, skipping")
+                                logger.warning(f"[WARN] Proxy {proxy_id} has no config, skipping")
+                    
+                    logger.info(f"[DEBUG] Available proxy IDs: {available_proxy_ids}")
                     
                     if not available_proxy_ids:
+                        logger.warning("[WARN] No healthy proxies available")
                         continue
                     
                     # Get or assign bound proxy for this session
@@ -813,13 +949,16 @@ class SessionManager:
                         session_name, available_proxy_ids
                     )
                     
+                    logger.info(f"[DEBUG] Bound proxy for {session_name}: {bound_proxy_id}")
+                    
                     if not bound_proxy_id:
+                        logger.warning(f"[WARN] No proxy bound for session {session_name}")
                         continue
                     
                     # Checkout the bound proxy
                     proxy_resource = proxy_manager.resource_pool.get(bound_proxy_id)
                     if not proxy_resource or proxy_resource.status != "READY":
-                        logger.warning(f"⚠️ Bound proxy {bound_proxy_id} not ready, trying next session")
+                        logger.warning(f"[WARN] Bound proxy {bound_proxy_id} not ready, trying next session")
                         continue
                     
                     # Mark proxy as IN_USE
@@ -830,23 +969,23 @@ class SessionManager:
                     proxy_config = proxy_resource.metadata.get("config", {}).copy()
                     proxy_config["proxy_id"] = bound_proxy_id
                     
-                    # ✅ FIX RACE CONDITION: Atomically mark session as IN_USE
+                    # [OK] FIX RACE CONDITION: Atomically mark session as IN_USE
                     if not self._atomic_try_mark_session_in_use(session_name):
-                        logger.debug(f"⚠️ Session {session_name} was taken by another worker, trying next...")
+                        logger.debug(f"[WARN] Session {session_name} was taken by another worker, trying next...")
                         continue
                     
                     logger.info(f"🔗 Session-Proxy bound checkout: {session_name} -> {bound_proxy_id}")
                     return (session_name, proxy_config)
                     
                 except Exception as e:
-                    logger.error(f"❌ Error binding session {session_name}: {e}")
+                    logger.error(f"[ERROR] Error binding session {session_name}: {e}")
                     continue
             
-            logger.warning("⚠️ Could not bind any available session with proxy")
+            logger.warning("[WARN] Could not bind any available session with proxy")
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error in session-proxy checkout: {e}")
+            logger.error(f"[ERROR] Error in session-proxy checkout: {e}")
             return None
     
     def checkin_session_with_proxy(self, session_name: str, proxy_config: Dict[str, Any], 
@@ -870,12 +1009,12 @@ class SessionManager:
             if proxy_config and "proxy_id" in proxy_config:
                 proxy_manager.checkin_proxy(proxy_config, proxy_status)
                 
-                logger.info(f"🔓 Session-Proxy checkin: {session_name} & {proxy_config['proxy_id']}")
+                logger.info(f"[UNLOCK] Session-Proxy checkin: {session_name} & {proxy_config['proxy_id']}")
             else:
-                logger.warning(f"⚠️ Invalid proxy config for checkin: {proxy_config}")
+                logger.warning(f"[WARN] Invalid proxy config for checkin: {proxy_config}")
                 
         except Exception as e:
-            logger.error(f"❌ Error in session-proxy checkin: {e}")
+            logger.error(f"[ERROR] Error in session-proxy checkin: {e}")
     
     def checkout_session_by_role(self, role: AccountRole, timeout: int = 30) -> Optional[str]:
         """
@@ -890,7 +1029,7 @@ class SessionManager:
         """
         start_time = time.time()
         
-        logger.debug(f"🎯 Requesting session with role: {role.value}")
+        logger.debug(f"[TARGET] Requesting session with role: {role.value}")
         
         while time.time() - start_time < timeout:
             # Process cooldowns first
@@ -902,7 +1041,7 @@ class SessionManager:
             )
             if result:
                 self._execute_with_locks(self._sync_resources_to_file)
-                logger.info(f"✅ Assigned {role.value} session: {result}")
+                logger.info(f"[OK] Assigned {role.value} session: {result}")
                 return result
             
             time.sleep(1)
@@ -930,7 +1069,7 @@ class SessionManager:
                 # Validate session folder
                 session_path = os.path.join(self.sessions_dir, resource_id)
                 if not os.path.exists(session_path) or not self._is_valid_session_folder(session_path):
-                    logger.warning(f"⚠️ Session invalid: {resource_id}")
+                    logger.warning(f"[WARN] Session invalid: {resource_id}")
                     resource.status = "NEEDS_LOGIN"
                     self.changes_since_last_sync += 1  # Track change for batching
                     continue
@@ -948,11 +1087,11 @@ class SessionManager:
             selected.status = "IN_USE"
             selected.last_used_timestamp = datetime.now()
             
-            logger.info(f"🎯 Intelligently selected session: {selected.id} (success_rate: {selected.success_rate:.2f})")
+            logger.info(f"[TARGET] Intelligently selected session: {selected.id} (success_rate: {selected.success_rate:.2f})")
             return selected.id
             
         except Exception as e:
-            logger.error(f"❌ Lỗi intelligent checkout: {e}")
+            logger.error(f"[ERROR] Error intelligent checkout: {e}")
             return None
     
     def _intelligent_checkout_by_role(self, role: AccountRole) -> Optional[str]:
@@ -981,11 +1120,11 @@ class SessionManager:
                 # Validate session folder
                 session_path = os.path.join(self.sessions_dir, resource_id)
                 if not os.path.exists(session_path) or not self._is_valid_session_folder(session_path):
-                    logger.warning(f"⚠️ Session invalid: {resource_id}")
+                    logger.warning(f"[WARN] Session invalid: {resource_id}")
                     resource.status = "NEEDS_LOGIN"
                     continue
                 
-                # 🎯 ROLE MATCHING LOGIC
+                # [TARGET] ROLE MATCHING LOGIC
                 # 1st priority: Exact role match
                 if resource.role == role:
                     available_sessions.append((resource, 10))  # Priority 10
@@ -1008,21 +1147,22 @@ class SessionManager:
             selected_resource.status = "IN_USE"
             selected_resource.last_used_timestamp = datetime.now()
             
-            logger.info(f"🎯 Selected {role.value} session: {selected_resource.id} (role: {selected_resource.role.value}, success_rate: {selected_resource.success_rate:.2f})")
+            logger.info(f"[TARGET] Selected {role.value} session: {selected_resource.id} (role: {selected_resource.role.value}, success_rate: {selected_resource.success_rate:.2f})")
             return selected_resource.id
             
         except Exception as e:
-            logger.error(f"❌ Lỗi checkout by role: {e}")
+            logger.error(f"[ERROR] Error checkout by role: {e}")
             return None
     
     def _select_best_resource(self, available_resources: List[ManagedResource]) -> ManagedResource:
         """
         Select best resource based on performance metrics
         """
-        # Sort by success rate (desc), then by last used (asc)
+        # Sort by quarantine count (asc), then success rate (desc), then by last used (asc)
         sorted_resources = sorted(
             available_resources,
             key=lambda r: (
+                r.quarantine_count,  # Fewer quarantines first (NEW PRIORITY)
                 -r.success_rate,  # Higher success rate first
                 r.consecutive_failures,  # Fewer failures first
                 r.last_used_timestamp or datetime.min  # Least recently used first
@@ -1033,7 +1173,7 @@ class SessionManager:
     
     def _process_cooldowns(self) -> int:
         """
-        ✅ FIX RACE CONDITION: Process quarantined resources with thread-safe status updates.
+        [OK] FIX RACE CONDITION: Process quarantined resources with thread-safe status updates.
         
         Returns:
             Number of resources released from quarantine
@@ -1050,7 +1190,7 @@ class SessionManager:
                         resource.quarantine_until_timestamp = None
                         resource.consecutive_failures = 0  # Reset failures after cooldown
                         released_count += 1
-                        logger.info(f"🎆 Resource {resource.id} released from quarantine")
+                        logger.info(f"[SUCCESS] Resource {resource.id} released from quarantine")
         
         return released_count
     
@@ -1075,7 +1215,7 @@ class SessionManager:
             elif resource.status == "DISABLED":
                 stats["disabled"] += 1
         
-        logger.debug(f"📊 Resource stats: {stats}")
+        logger.debug(f"[STATS] Resource stats: {stats}")
     
     def checkin_session(self, session_name: str, status: str = "READY"):
         """
@@ -1088,11 +1228,15 @@ class SessionManager:
         self._execute_with_locks(
             lambda: self._intelligent_checkin(session_name, status)
         )
-        self._execute_with_locks(self._sync_resources_to_file)
+        # [OK] FIX CRITICAL: Force immediate file sync to persist timestamp updates
+        # Auto-recovery needs file to be updated immediately to prevent perpetual stuck detection
+        self._execute_with_locks(lambda: self._sync_resources_to_file(force=True))
     
     def _intelligent_checkin(self, session_name: str, status: str) -> None:
         """
         Intelligent checkin với performance tracking.
+        
+        [OK] FIX CRITICAL: Reload file first to prevent overwriting changes from other workers!
         
         Args:
             session_name: Tên session
@@ -1102,18 +1246,26 @@ class SessionManager:
             None
         """
         try:
+            # [OK] FIX: Reload from file to get latest state from other workers
+            # CRITICAL for multi-process (Celery workers) to prevent lost updates
+            self._load_resources_to_memory()
+            
             if session_name not in self.resource_pool:
-                logger.warning(f"⚠️ Session không tồn tại: {session_name}")
+                logger.warning(f"[WARN] Session không exists: {session_name}")
                 return
             
             resource = self.resource_pool[session_name]
             old_status = resource.status
             resource.status = status
             
-            logger.info(f"🔓 Checked in session: {session_name} ({old_status} → {status})")
+            # [OK] FIX CRITICAL: Update last_used_timestamp to prevent perpetual "stuck" detection
+            # Auto-recovery needs this to know session is no longer stuck
+            resource.last_used_timestamp = datetime.now()
+            
+            logger.info(f"[UNLOCK] Checked in session: {session_name} ({old_status} -> {status})")
             
         except Exception as e:
-            logger.error(f"❌ Lỗi intelligent checkin {session_name}: {e}")
+            logger.error(f"[ERROR] Error intelligent checkin {session_name}: {e}")
     
     def configure_account_roles(self, role_assignments: Dict[str, AccountRole]) -> int:
         """
@@ -1124,7 +1276,7 @@ class SessionManager:
                               e.g., {"account_1": AccountRole.DISCOVERY, "account_2": AccountRole.TRACKING}
                               
         Returns:
-            Số lượng accounts đã configure
+            Số lượng accounts done: configure
         """
         def _update_roles():
             updated_count = 0
@@ -1132,23 +1284,25 @@ class SessionManager:
                 if session_name in self.resource_pool:
                     old_role = self.resource_pool[session_name].role
                     self.resource_pool[session_name].role = role
-                    logger.info(f"🎯 Account {session_name}: {old_role.value} → {role.value}")
+                    logger.info(f"[TARGET] Account {session_name}: {old_role.value} -> {role.value}")
                     updated_count += 1
                 else:
-                    logger.warning(f"⚠️ Session {session_name} không tồn tại để configure role")
+                    logger.warning(f"[WARN] Session {session_name} không exists để configure role")
             return updated_count
         
         updated_count = self._execute_with_locks(_update_roles)
         
         if updated_count > 0:
             self._execute_with_locks(self._sync_resources_to_file)
-            logger.info(f"✅ Đã configure {updated_count} account roles")
+            logger.info(f"[OK] Done: configure {updated_count} account roles")
             
         return updated_count
     
     def get_accounts_by_role(self, role: AccountRole) -> List[str]:
         """
         Lấy danh sách account names theo role cụ thể
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Args:
             role: AccountRole cần tìm
@@ -1165,6 +1319,8 @@ class SessionManager:
     def get_role_distribution(self) -> Dict[str, int]:
         """
         Lấy phân bổ roles trong pool
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Returns:
             Dict với key là role names và value là count
@@ -1190,7 +1346,9 @@ class SessionManager:
     
     def get_status(self) -> Dict[str, Dict[str, Any]]:
         """
-        Lấy trạng thái hiện tại của tất cả sessions (thread + process-safe)
+        Lấy trạng thái hiện tại của tất cả sessions
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Returns:
             Dict chứa session status và performance metrics
@@ -1212,6 +1370,8 @@ class SessionManager:
     def get_stats(self) -> Dict[str, Any]:
         """
         Lấy thống kê chi tiết về sessions và performance
+        
+        Uses thread-only lock for performance (acceptable stale data for stats).
         
         Returns:
             Dict chứa thống kê chi tiết
@@ -1285,6 +1445,8 @@ class SessionManager:
         """
         Lấy trạng thái của tất cả sessions cho diagnostic
         
+        Uses thread-only lock for performance (read-only operation).
+        
         Returns:
             Dict chứa thông tin chi tiết về sessions
         """
@@ -1336,12 +1498,14 @@ class SessionManager:
             session_name: Tên session
             reason: Lý do không hợp lệ
         """
-        logger.warning(f"❌ Marking session invalid: {session_name} - {reason}")
+        logger.warning(f"[ERROR] Marking session invalid: {session_name} - {reason}")
         self.checkin_session(session_name, "NEEDS_LOGIN")
     
     def report_outcome(self, session_name: str, outcome: str, details: Optional[Dict[str, Any]] = None) -> None:
         """
         Báo cáo kết quả task để cập nhật performance metrics
+        
+        [OK] FIX CRITICAL: Reload file first to prevent overwriting changes from other workers!
         
         Args:
             session_name: Tên session
@@ -1352,8 +1516,11 @@ class SessionManager:
             None
         """
         with self.locks():
+            # [OK] FIX: Reload from file to get latest state from other workers
+            self._load_resources_to_memory()
+            
             if session_name not in self.resource_pool:
-                logger.warning(f"⚠️ Session không tồn tại để report outcome: {session_name}")
+                logger.warning(f"[WARN] Session không exists để report outcome: {session_name}")
                 return
             
             resource = self.resource_pool[session_name]
@@ -1362,29 +1529,29 @@ class SessionManager:
             if outcome == 'success':
                 resource.successful_tasks += 1
                 resource.consecutive_failures = 0
-                logger.debug(f"✅ Success reported for {session_name}")
+                logger.debug(f"[OK] Success reported for {session_name}")
             elif outcome == 'failure':
                 resource.consecutive_failures += 1
-                logger.debug(f"❌ Failure reported for {session_name} (consecutive: {resource.consecutive_failures})")
+                logger.debug(f"[ERROR] Failure reported for {session_name} (consecutive: {resource.consecutive_failures})")
                 
-                # 🔥 FIX #4: CIRCUIT BREAKER - Unbind proxy after repeated failures
-                # This breaks the error loop between session and bad proxy
+                # [LOCK] PERMANENT BINDING POLICY: NEVER unbind, even on repeated failures!
+                # Instead, mark as QUARANTINE but KEEP the binding intact
                 if resource.consecutive_failures >= 3:
-                    logger.critical(f"🔌 CIRCUIT BREAKER: Session {session_name} has {resource.consecutive_failures} consecutive failures")
-                    # Unbind from current proxy to allow re-assignment
+                    logger.critical(f"[STOP] QUARANTINE: Session {session_name} has {resource.consecutive_failures} consecutive failures")
+                    
+                    # [OK] Mark as NEEDS_LOGIN or QUARANTINE (but DON'T unbind!)
                     try:
-                        self.proxy_binder.unbind_session(session_name)
-                        logger.warning(f"🔓 Circuit breaker unbound session {session_name} to break error loop")
+                        logger.warning(f"[LOCK] PERMANENT BINDING MAINTAINED: {session_name} -> same proxy")
+                        logger.info(f"[TIP] Session will be retried with SAME proxy after recovery")
                         
-                        # 🔥 CRITICAL FIX: Reset failures to allow session recovery
-                        resource.consecutive_failures = 0
-                        logger.info(f"♻️ Reset consecutive failures for {session_name} after circuit break")
+                        # Mark status but DON'T unbind
+                        resource.status = "NEEDS_LOGIN"  # Or "QUARANTINE" if you prefer
                         
                         # Persist immediately to prevent loss on crash
                         self._sync_resources_to_file()
                         
                     except Exception as e:
-                        logger.error(f"❌ Failed to unbind session in circuit breaker: {e}")
+                        logger.error(f"[ERROR] Failed to unbind session in circuit breaker: {e}")
             
             # Recalculate success rate
             resource.calculate_success_rate()
@@ -1413,7 +1580,7 @@ class SessionManager:
         """
         with self.locks():
             if session_name not in self.resource_pool:
-                logger.warning(f"⚠️ Session không tồn tại để quarantine: {session_name}")
+                logger.warning(f"[WARN] Session không exists để quarantine: {session_name}")
                 return
             
             resource = self.resource_pool[session_name]
@@ -1422,7 +1589,7 @@ class SessionManager:
             resource.quarantine_count += 1
             resource.quarantine_until_timestamp = datetime.now() + timedelta(minutes=self.quarantine_duration_minutes)
             
-            logger.warning(f"🚨 Session {session_name} quarantined until {resource.quarantine_until_timestamp.strftime('%H:%M:%S')} - {reason}")
+            logger.warning(f"[ALERT] Session {session_name} quarantined until {resource.quarantine_until_timestamp.strftime('%H:%M:%S')} - {reason}")
             
             # Sync to file
             self._sync_resources_to_file()
@@ -1442,7 +1609,7 @@ class SessionManager:
                 resource.quarantine_reason = None
             
             self._sync_resources_to_file(force=True)  # Force immediate sync for reset
-            logger.info("🔄 Reset tất cả sessions về READY")
+            logger.info("[RELOAD] Reset tất cả sessions về READY")
     
     def check_cooldowns(self) -> int:
         """
@@ -1460,12 +1627,14 @@ class SessionManager:
         """
         Legacy compatibility - redirects to report_outcome
         
+        Uses thread-only lock (legacy method, acceptable for quick check).
+        
         Args:
             session_name: Tên session
             threshold: Ngưỡng failures (deprecated, uses class settings)
             
         Returns:
-            True nếu session đã bị quarantine
+            True nếu session done: bị quarantine
         """
         logger.debug(f"Legacy increment_failure_count called for {session_name}")
         
@@ -1498,6 +1667,8 @@ class SessionManager:
         """
         Lấy danh sách tất cả session names
         
+        Uses thread-only lock for performance (read-only operation).
+        
         Returns:
             List tên sessions
         """
@@ -1507,6 +1678,8 @@ class SessionManager:
     def get_session_performance(self, session_name: str) -> Optional[Dict[str, Any]]:
         """
         Lấy performance metrics của một session cụ thể
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Args:
             session_name: Tên session
@@ -1533,6 +1706,8 @@ class SessionManager:
     def get_best_performers(self, limit: int = 5) -> List[Dict[str, Any]]:
         """
         Lấy danh sách sessions với performance tốt nhất
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Args:
             limit: Số lượng sessions trả về
@@ -1569,6 +1744,8 @@ class SessionManager:
         """
         Lấy danh sách các sessions đang bị quarantine
         
+        Uses thread-only lock for performance (read-only operation).
+        
         Returns:
             List các session bị quarantine với thông tin chi tiết
         """
@@ -1595,7 +1772,9 @@ class SessionManager:
     
     def auto_cleanup_stuck_sessions(self, timeout_minutes: int = 30) -> int:
         """
-        🔥 AUTO CLEANUP: Tự động phát hiện và giải phóng sessions bị stuck
+        [HOT] AUTO CLEANUP: Tự động phát hiện và giải phóng sessions bị stuck
+        
+        [OK] FIX CRITICAL: Reload file first to get latest session states from all workers!
         
         Một session được coi là "stuck" nếu:
         - Status = IN_USE
@@ -1605,13 +1784,16 @@ class SessionManager:
             timeout_minutes: Số phút timeout để coi session là stuck
             
         Returns:
-            Số sessions đã được giải phóng
+            Số sessions done: được giải phóng
         """
         released_count = 0
         current_time = datetime.now()
         timeout_delta = timedelta(minutes=timeout_minutes)
         
         with self.locks():
+            # [OK] FIX: Reload from file to check ACTUAL stuck sessions (not stale data)
+            self._load_resources_to_memory()
+            
             for session_name, resource in self.resource_pool.items():
                 # Check if session is stuck
                 if resource.status == "IN_USE":
@@ -1624,7 +1806,7 @@ class SessionManager:
                         if time_in_use > timeout_delta:
                             # Session is stuck! Release it
                             logger.warning(
-                                f"🚨 STUCK SESSION DETECTED: {session_name} has been IN_USE for "
+                                f"[ALERT] STUCK SESSION DETECTED: {session_name} has been IN_USE for "
                                 f"{time_in_use.total_seconds()/60:.1f} minutes. Releasing..."
                             )
                             
@@ -1632,11 +1814,11 @@ class SessionManager:
                             resource.last_used_timestamp = current_time
                             released_count += 1
                             
-                            logger.info(f"✅ Released stuck session: {session_name}")
+                            logger.info(f"[OK] Released stuck session: {session_name}")
             
             if released_count > 0:
                 self._sync_resources_to_file(force=True)
-                logger.info(f"🧹 Auto-cleanup released {released_count} stuck sessions")
+                logger.info(f"[CLEAN] Auto-cleanup released {released_count} stuck sessions")
             
             return released_count
     
@@ -1644,6 +1826,8 @@ class SessionManager:
         """
         Lấy thông tin chi tiết về các sessions đang IN_USE
         Hữu ích cho monitoring và debugging
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Returns:
             List thông tin các sessions IN_USE
@@ -1675,6 +1859,8 @@ class SessionManager:
     def health_check_sessions(self) -> Dict[str, Any]:
         """
         🏥 HEALTH CHECK: Kiểm tra sức khỏe toàn bộ session pool
+        
+        Uses thread-only lock for performance (read-only diagnostic).
         
         Returns:
             Dict với thông tin health check và recommendations
@@ -1715,9 +1901,11 @@ class SessionManager:
                 recommendations.append("Re-login required sessions using auto_login.py")
             
             # Check 5: Low average success rate
-            if stats['average_success_rate'] < 0.5:  # Below 50%
+            # FIX: Correct key path - get_stats() returns nested structure
+            avg_success_rate = stats.get('performance', {}).get('avg_success_rate', 1.0)
+            if avg_success_rate < 0.5:  # Below 50%
                 health_score -= 10
-                warnings.append(f"Low average success rate: {stats['average_success_rate']:.1%}")
+                warnings.append(f"Low average success rate: {avg_success_rate:.1%}")
                 recommendations.append("Review scraping logic and error handling")
             
             health_status = "HEALTHY" if health_score >= 80 else "DEGRADED" if health_score >= 50 else "CRITICAL"
@@ -1736,7 +1924,7 @@ class SessionManager:
     
     def auto_recovery(self, max_stuck_minutes: int = 30) -> Dict[str, Any]:
         """
-        🚑 AUTO RECOVERY: Tự động phục hồi hệ thống từ trạng thái lỗi
+        🚑 AUTO RECOVERY: Tự động phục hồi hệ thống từ trạng thái error
         
         Thực hiện các actions:
         1. Release stuck sessions
@@ -1771,12 +1959,12 @@ class SessionManager:
         
         if released > 0 or cooldown_released > 0:
             logger.info(
-                f"✅ Auto-recovery completed: "
+                f"[OK] Auto-recovery completed: "
                 f"Released {released} stuck sessions, "
                 f"Processed {cooldown_released} cooldowns"
             )
         else:
-            logger.info("✅ Auto-recovery completed: No actions needed")
+            logger.info("[OK] Auto-recovery completed: No actions needed")
         
         return recovery_result
 
@@ -1807,18 +1995,18 @@ def test_session_manager():
         
         # Test checkout
         session = manager.checkout_session(timeout=5)
-        print(f"✅ Checkout session: {session}")
+        print(f"[OK] Checkout session: {session}")
         
         # Test stats
         stats = manager.get_stats()
-        print(f"✅ Stats: {stats}")
+        print(f"[OK] Stats: {stats}")
         
         # Test checkin
         if session:
             manager.checkin_session(session)
-            print(f"✅ Checkin session: {session}")
+            print(f"[OK] Checkin session: {session}")
         
-        print("✅ SessionManager test completed!")
+        print("[OK] SessionManager test completed!")
         
     finally:
         # Cleanup

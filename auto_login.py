@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Script tự động đăng nhập Facebook với 2FA
-Sử dụng dữ liệu từ account.txt với format: id|password|2fa_code|email|password_alt|email_alt
-
+Sử dụng dữ liệu từ account.txt với format:
+  - Format: id|password|2fa_secret
+  
 Phase 3.0: Tự động hóa hoàn toàn quy trình đăng nhập với xử lý 2FA
+KHÔNG SỬ DỤNG cookie injection - chỉ real login qua 2FA để tránh checkpoint
 """
 
 import asyncio
@@ -40,7 +42,7 @@ class FacebookAutoLogin:
         This is needed because:
         - Sessions might be in use by workers
         - Chrome creates lock files that persist even after crash
-        - Docker containers might have stale locks
+        - VPS might have stale locks from previous runs
         """
         import glob
         
@@ -71,38 +73,69 @@ class FacebookAutoLogin:
 
     def parse_account_file(self, account_file_path: str) -> List[Dict[str, str]]:
         """
-        Parse account.txt file with format:
-        id|password|2fa_secret|... (chỉ quan tâm 3 field đầu)
+        ✅ UPDATED: Đọc accounts từ DATABASE thay vì file
+        
+        Lấy tất cả accounts có:
+        - status = ACTIVE
+        - session_status = NOT_CREATED hoặc NEEDS_LOGIN
         
         Returns:
-            List of account dictionaries
+            List of account dictionaries (id, password, 2fa_secret)
         """
         accounts = []
+        
         try:
-            with open(account_file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                
-            for line_num, line in enumerate(lines, 1):
-                line = line.strip()
-                if not line or line.startswith('#'):  # Skip empty lines and comments
-                    continue
-                    
-                parts = line.split('|')
-                if len(parts) >= 3:  # Chỉ cần 3 field đầu: id|password|2fa_secret
+            # Import DatabaseManager
+            from core.database_manager import DatabaseManager
+            
+            db = DatabaseManager()
+            
+            # Lấy tất cả accounts từ database
+            db_accounts = db.get_all_accounts(is_active=True)
+            
+            if not db_accounts:
+                print(f"[SKIP] Không có accounts trong database")
+                print(f"[INFO] 💡 Add accounts via Admin Panel UI instead")
+                return []
+            
+            # Convert database accounts to format needed for auto_login
+            for idx, acc in enumerate(db_accounts, 1):
+                # Chỉ login những account chưa có session hoặc cần login lại
+                session_status = acc.get('session_status', 'NOT_CREATED')
+                if session_status in ['NOT_CREATED', 'NEEDS_LOGIN']:
                     account = {
-                        'id': parts[0].strip(),
-                        'password': parts[1].strip(),
-                        '2fa_secret': parts[2].strip(),
-                        'line_number': line_num
+                        'id': acc['facebook_id'],
+                        'password': acc.get('password', ''),
+                        '2fa_secret': acc.get('totp_secret', ''),
+                        'cookies': None,  # ❌ KHÔNG dùng cookies - luôn force real login
+                        'line_number': idx,
+                        'db_id': acc['id']  # Store DB ID for updating later
                     }
-                    accounts.append(account)
-                else:
-                    print(f"[WARNING] Dòng {line_num} không đúng format (cần ít nhất id|password|2fa): {line}")
                     
-        except FileNotFoundError:
-            print(f"[ERROR] Không tìm thấy file: {account_file_path}")
+                    # Validate account has required fields
+                    if not account['id']:
+                        print(f"[WARNING] Account ID {acc['id']} thiếu facebook_id, skip")
+                        continue
+                    
+                    if not account['password']:
+                        print(f"[WARNING] Account {account['id']} thiếu password, skip")
+                        continue
+                        
+                    if not account['2fa_secret']:
+                        print(f"[WARNING] Account {account['id']} thiếu 2FA secret, skip")
+                        continue
+                    
+                    accounts.append(account)
+                    print(f"[DB] Loaded account {account['id']} (DB ID: {account['db_id']}, Status: {session_status})")
+                else:
+                    print(f"[SKIP] Account {acc['facebook_id']} already logged in (Status: {session_status})")
+            
+            print(f"[DB] Total accounts to login: {len(accounts)}/{len(db_accounts)}")
+            
         except Exception as e:
-            print(f"[ERROR] Lỗi đọc file account: {e}")
+            print(f"[ERROR] Lỗi đọc accounts từ database: {e}")
+            import traceback
+            traceback.print_exc()
             
         return accounts
 
@@ -132,14 +165,16 @@ class FacebookAutoLogin:
             # Return the original secret as fallback (in case it's already a code)
             return secret
 
-    async def setup_browser(self, session_name: str, headless: bool = True):
+
+    async def setup_browser(self, session_name: str, headless: bool = False):
         """
-        Setup browser with session - FIXED for Docker headless mode
+        Setup browser with session - Production-ready for VPS deployment
         
-        CRITICAL FIXES:
-        1. ✅ Default headless=True (Docker has no X server)
-        2. ✅ Remove storage_state param (not supported in persistent context)
-        3. ✅ Clean singleton locks before launch
+        FEATURES:
+        1. ✅ Anti-detection mode (default=False for GUI with Xvfb)
+        2. [OK] Remove storage_state param (not supported in persistent context)
+        3. [OK] Clean singleton locks before launch
+        4. [FINGERPRINT] Load per-session fingerprint (GenLogin/GPM style)
         """
         sessions_base_dir = os.path.join(os.getcwd(), "sessions")
         user_data_dir = os.path.join(sessions_base_dir, session_name)
@@ -148,25 +183,160 @@ class FacebookAutoLogin:
         os.makedirs(user_data_dir, exist_ok=True)
         print(f"[FOLDER] Su dung session folder: {user_data_dir}")
         
-        # ✅ FIX: Clean singleton locks before launch (prevent "profile in use" error)
+        # [OK] FIX: Clean singleton locks before launch (prevent "profile in use" error)
         self._cleanup_singleton_locks(user_data_dir)
         
+        # [FINGERPRINT] RE-GENERATE fingerprint with current age (for evolution)
+        session_fingerprint = None
+        proxy_config = None
+        
+        try:
+            from core.session_manager import SessionManager
+            from core.proxy_manager import ProxyManager
+            from core.session_proxy_binder import SessionProxyBinder
+            from utils.browser_config import generate_session_fingerprint
+            from datetime import datetime
+            
+            session_manager = SessionManager()
+            session_resource = session_manager.resource_pool.get(session_name)
+            
+            if session_resource:
+                # ✅ RE-GENERATE fingerprint with CURRENT age (not cached)
+                days_since_creation = 0
+                if session_resource.created_at:
+                    days_since_creation = (datetime.now() - session_resource.created_at).days
+                
+                session_fingerprint = generate_session_fingerprint(
+                    session_name,
+                    days_since_creation=days_since_creation
+                )
+                
+                print(f"[FINGERPRINT] Regenerated for {session_name} (age: {days_since_creation} days): "
+                      f"WebGL={session_fingerprint.get('webgl', {}).get('vendor', 'N/A')}, "
+                      f"Screen={session_fingerprint.get('hardware', {}).get('screen_width', 'N/A')}x{session_fingerprint.get('hardware', {}).get('screen_height', 'N/A')}")
+            else:
+                print(f"[FINGERPRINT] [WARN] No session resource for {session_name}")
+            
+            # [PROXY] PHASE 3: Load proxy binding (CRITICAL for IP consistency!)
+            from core.database_manager import DatabaseManager
+            db = DatabaseManager()
+            proxy_manager = ProxyManager(db_manager=db)
+            binder = SessionProxyBinder(db_manager=db)
+            
+            # Get available proxies
+            available_proxies = proxy_manager.get_healthy_proxy_ids()
+            
+            if available_proxies:
+                # Get bound proxy for session
+                bound_proxy_id = binder.get_proxy_for_session(session_name, available_proxies)
+                
+                if bound_proxy_id:
+                    # ✅ FIX: Get proxy from database instead of using get_proxy_config (method doesn't exist)
+                    try:
+                        from core.database_manager import DatabaseManager
+                        db = DatabaseManager()
+                        # Extract proxy ID number from proxy_id string (e.g., "proxy_2" -> 2)
+                        proxy_id_num = int(bound_proxy_id.split('_')[1]) if '_' in bound_proxy_id else int(bound_proxy_id)
+                        proxy_data = db.get_proxy_by_id(proxy_id_num)
+                        
+                        if proxy_data:
+                            proxy_config = {
+                                'host': proxy_data['host'],
+                                'port': proxy_data['port'],
+                                'username': proxy_data.get('username'),
+                                'password': proxy_data.get('password'),
+                                'type': proxy_data.get('proxy_type', 'http'),
+                                'proxy_id': bound_proxy_id
+                            }
+                            print(f"[PROXY] Using bound proxy: {bound_proxy_id} ({proxy_config['host']}:{proxy_config['port']})")
+                        else:
+                            proxy_config = None
+                            print(f"[PROXY/WARN] Proxy {bound_proxy_id} not found in database")
+                    except Exception as e:
+                        print(f"[PROXY/ERROR] Error loading proxy config: {e}")
+                        proxy_config = None
+                    
+                    if proxy_config:
+                        # [PROXY] PHASE 3: Inject proxy geolocation into fingerprint
+                        if session_fingerprint and bound_proxy_id in proxy_manager.resource_pool:
+                            proxy_resource = proxy_manager.resource_pool[bound_proxy_id]
+                            proxy_geo = proxy_resource.metadata.get('geolocation')
+                            
+                            if proxy_geo:
+                                # ✅ STRICT VALIDATION: REJECT if geolocation invalid
+                                required_fields = ['latitude', 'longitude', 'timezone', 'country']
+                                missing_fields = [f for f in required_fields if not proxy_geo.get(f)]
+                                
+                                if missing_fields:
+                                    error_msg = f"Proxy {bound_proxy_id} geolocation incomplete (missing: {missing_fields}) - ABORTING"
+                                    print(f"[PROXY] [ERROR] {error_msg}")
+                                    raise Exception(error_msg)
+                                
+                                # Validate coordinate ranges
+                                lat = proxy_geo.get('latitude')
+                                lng = proxy_geo.get('longitude')
+                                
+                                if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                                    error_msg = f"Invalid proxy coordinates: lat={lat}, lng={lng} - ABORTING"
+                                    print(f"[PROXY] [ERROR] {error_msg}")
+                                    raise Exception(error_msg)
+                                
+                                # ✅ Valid - apply to fingerprint
+                                session_fingerprint['timezone'] = proxy_geo['timezone']
+                                session_fingerprint['geolocation'] = {
+                                    'latitude': lat,
+                                    'longitude': lng,
+                                    'accuracy': 100
+                                }
+                                print(f"[PROXY] ✅ Validated geo: {proxy_geo.get('city')}, {proxy_geo.get('country')} (TZ: {proxy_geo['timezone']})")
+                            else:
+                                # ❌ NO geolocation - ABORT
+                                error_msg = f"Proxy {bound_proxy_id} has NO geolocation data - ABORTING"
+                                print(f"[PROXY] [ERROR] {error_msg}")
+                                raise Exception(error_msg)
+                    else:
+                        print(f"[PROXY] [WARN] Could not get config for proxy {bound_proxy_id}")
+                else:
+                    print(f"[PROXY] [WARN] No bound proxy for {session_name}, using direct connection")
+            else:
+                print(f"[PROXY] [WARN] No available proxies, using direct connection")
+                
+        except Exception as e:
+            print(f"[FINGERPRINT/PROXY] [ERROR] Error: {e}")
+        
+        # 🔒 ANTI-DETECTION: Inject unique machine ID per session BEFORE browser launch
+        try:
+            from utils.browser_config import generate_unique_machine_id, inject_machine_id_to_local_state
+            from datetime import datetime
+            
+            # Generate deterministic machine ID (use current time for new sessions)
+            creation_date = datetime.now() if not os.path.exists(os.path.join(user_data_dir, "Local State")) else None
+            machine_id = generate_unique_machine_id(session_name, creation_date)
+            
+            # Inject into Chromium Local State BEFORE browser reads it
+            inject_machine_id_to_local_state(user_data_dir, machine_id)
+            print(f"[MACHINE-ID] Injected unique ID for {session_name}: {machine_id[:13]}...")
+        except Exception as e:
+            print(f"[MACHINE-ID] [WARN] Failed to inject (non-critical): {e}")
+        
         # Launch browser with consistent configuration
-        # ✅ CRITICAL: NO PROXY for login (use direct connection)
+        # [PROXY] CRITICAL FIX: Use SAME proxy as multi_queue_worker for IP consistency!
         launch_options = get_browser_launch_options(
             user_data_dir, 
             headless=headless,
-            proxy_config=None  # Explicitly no proxy for login
+            proxy_config=proxy_config,  # [PROXY] PHASE 3: Use bound proxy!
+            session_fingerprint=session_fingerprint  # [FINGERPRINT] Apply fingerprint
         )
         
-        # ✅ FIX: DON'T add storage_state to launch_options
+        # [OK] FIX: DON'T add storage_state to launch_options
         # Persistent context auto-saves state to user_data_dir
         # storage_state parameter is NOT supported in launch_persistent_context()
         
         self.browser = await self.playwright.chromium.launch_persistent_context(**launch_options)
         
-        # SỬ DỤNG INIT SCRIPT CENTRALIZED - Đảm bảo anti-detection 100% nhất quán  
-        await self.browser.add_init_script(get_init_script())
+        # [FINGERPRINT] Use centralized init script with fingerprint - GenLogin/GPM style
+        await self.browser.add_init_script(get_init_script(session_fingerprint))
+        print(f"[FINGERPRINT] Applied advanced anti-detect fingerprint")
         
         # Get or create page
         self.page = self.browser.pages[0] if self.browser.pages else await self.browser.new_page()
@@ -212,7 +382,7 @@ class FacebookAutoLogin:
             
             # Step 4: Verify login success - Enhanced with storage state saving
             if await self.is_logged_in():
-                print("[SUCCESS] ✅ Đăng nhập thành công!")
+                print("[SUCCESS] Login successful!")
                 
                 # ENHANCED: Explicitly save cookies and storage state
                 try:
@@ -231,7 +401,7 @@ class FacebookAutoLogin:
                 
                 return True
             else:
-                print("[ERROR] ❌ Đăng nhập thất bại")
+                print("[ERROR] Login failed")
                 return False
                 
         except Exception as e:
@@ -494,11 +664,13 @@ class FacebookAutoLogin:
         """
         Check if session folder exists and has required files
         
+        [OK] FIX CRITICAL: Also check session_status.json to detect NEEDS_LOGIN!
+        
         Args:
             session_name: Session folder name
             
         Returns:
-            True if session appears valid
+            True if session appears valid AND not marked as NEEDS_LOGIN
         """
         try:
             sessions_base_dir = os.path.join(os.getcwd(), "sessions")
@@ -521,22 +693,52 @@ class FacebookAutoLogin:
             
             has_cookies = os.path.exists(cookies_path) or os.path.exists(network_cookies)
             
-            return has_cookies
+            if not has_cookies:
+                return False
+            
+            # [OK] CRITICAL FIX: Check session_status.json to detect NEEDS_LOGIN/QUARANTINED
+            try:
+                import json
+                status_file = 'session_status.json'
+                if os.path.exists(status_file):
+                    with open(status_file, 'r', encoding='utf-8') as f:
+                        session_data = json.load(f)
+                    
+                    # Check if session exists in status file
+                    if session_name in session_data:
+                        session_status = session_data[session_name].get('status', 'UNKNOWN')
+                        
+                        # Session is INVALID if status is NEEDS_LOGIN, QUARANTINED, or DISABLED
+                        if session_status in ['NEEDS_LOGIN', 'QUARANTINED', 'DISABLED']:
+                            print(f"[CHECK] Session {session_name} status: {session_status} - NEEDS RE-LOGIN")
+                            return False
+                        
+                        print(f"[CHECK] Session {session_name} status: {session_status} - OK")
+                    else:
+                        print(f"[CHECK] Session {session_name} not found in session_status.json - assuming VALID")
+            except Exception as status_err:
+                print(f"[WARNING] Could not check session_status.json: {status_err}")
+                # If can't read status file, fallback to folder check only
+            
+            return True
             
         except Exception as e:
             print(f"[WARNING] Error checking session validity for {session_name}: {e}")
             return False
 
-    async def update_session_status(self, session_name: str):
-        """Update session status in system - GIỐNG Y HỆT manual_login.py"""
+    async def update_session_status(self, session_name: str, db_account_id: int = None):
+        """Update session status in system - UPDATED: Also update database"""
         try:
             print("[UPDATE] Cap nhat session status va session-proxy binding...")
             
             from core.session_manager import SessionManager
             from core.proxy_manager import ProxyManager
+            from core.database_manager import DatabaseManager
+            from datetime import datetime
             
             session_manager = SessionManager()
             proxy_manager = ProxyManager()
+            db = DatabaseManager()
             
             # CONSISTENT: Cap nhat session status voi binding system - GIỐNG Y HỆT manual_login.py
             proxy_stats = proxy_manager.get_stats()
@@ -570,6 +772,20 @@ class FacebookAutoLogin:
                 session_manager.checkin_session(session_name, "READY")
             
             print(f"[READY] Session '{session_name}' da duoc cap nhat thanh 'READY' trong pool.")
+            
+            # ✅ UPDATE DATABASE: Update accounts table with session info
+            if db_account_id:
+                session_folder = f"sessions/{session_name}"
+                success = db.update_account_session(
+                    account_id=db_account_id,
+                    session_folder=session_folder,
+                    session_status='LOGGED_IN',
+                    last_login_at=datetime.now()
+                )
+                if success:
+                    print(f"[DB] ✅ Updated database for account {db_account_id}: session_status='LOGGED_IN'")
+                else:
+                    print(f"[DB] ⚠️  Failed to update database for account {db_account_id}")
 
         except Exception as e:
             print(f"[ERROR] Khong the cap nhat session status: {e}")
@@ -577,30 +793,29 @@ class FacebookAutoLogin:
 
 
 async def auto_login_from_file(account_file: str, account_index: Optional[int] = None, 
-                              headless: bool = True, skip_existing: bool = True):
+                              headless: bool = False, skip_existing: bool = True):
     """
     Tự động đăng nhập từ file account.txt - ENHANCED for Docker
     
     Args:
         account_file: Path to account file
         account_index: Index of account to login (0-based), None for all accounts
-        headless: Run in headless mode
+        headless: Run in headless mode (False = GUI mode for anti-detection)
         skip_existing: Skip accounts that already have valid sessions
     """
-    # Detect Docker environment
-    is_docker = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER', False)
-    env_label = "DOCKER" if is_docker else "LOCAL"
-    
-    print("[AUTO_LOGIN] AUTO LOGIN MODE - PHASE 3.0 (ENHANCED)")
-    print(f"Environment: {env_label} | Headless: {headless} | Skip existing: {skip_existing}")
+    print("[AUTO_LOGIN] AUTO LOGIN MODE - PHASE 3.0 (PRODUCTION)")
+    print(f"Headless: {headless} | Skip existing: {skip_existing}")
     print("=" * 60)
     
     async with FacebookAutoLogin() as fb_login:
+        # ✅ UPDATED: Không cần check file nữa vì parse_account_file() đọc từ database
+        # Vẫn truyền account_file param để giữ backward compatibility
+        print(f"[DB] Loading accounts from database...")
         accounts = fb_login.parse_account_file(account_file)
         
         if not accounts:
-            print("[ERROR] Không tìm thấy account nào trong file")
-            return False
+            print("[INFO] Không có account nào cần login (database trống hoặc tất cả đã login)")
+            return True  # Not an error - just nothing to do
         
         print(f"[INFO] Tim thay {len(accounts)} account(s)")
         
@@ -632,19 +847,125 @@ async def auto_login_from_file(account_file: str, account_index: Optional[int] =
                 continue
             
             try:
-                # Setup browser for this account
+                # [FIX] CREATE BINDING BEFORE SETUP BROWSER (for IP consistency)
+                try:
+                    from core.session_proxy_binder import SessionProxyBinder
+                    from core.proxy_manager import ProxyManager
+                    
+                    # Initialize managers
+                    from core.database_manager import DatabaseManager
+                    db = DatabaseManager()
+                    binder = SessionProxyBinder(db_manager=db)
+                    proxy_mgr = ProxyManager(db_manager=db)
+                    
+                    # Get available healthy proxies
+                    healthy_proxy_ids = proxy_mgr.get_healthy_proxy_ids(force_check=False)
+                    
+                    if healthy_proxy_ids:
+                        # Check if session already has binding
+                        existing_binding = binder.bindings_cache.get(session_name)
+                        
+                        if not existing_binding:
+                            # ✅ FIX: Chọn proxy chưa được bind (tránh duplicate)
+                            all_bindings = binder.get_all_bindings()
+                            already_bound_proxies = set(all_bindings.values())
+                            
+                            # Tìm proxy chưa được bind
+                            available_proxy = None
+                            for proxy_candidate in healthy_proxy_ids:
+                                if proxy_candidate not in already_bound_proxies:
+                                    available_proxy = proxy_candidate
+                                    break
+                            
+                            # Fallback: nếu tất cả đã bind, reuse proxy (round-robin)
+                            if not available_proxy:
+                                available_proxy = healthy_proxy_ids[0]
+                                print(f"[PRE-BINDING] ⚠️  All proxies bound, reusing {available_proxy}")
+                            
+                            # ✅ FIX RACE: Use atomic method instead of direct cache access
+                            if binder.bind_session_atomic(session_name, available_proxy):
+                                print(f"[PRE-BINDING] ✅ Created binding: {session_name} → {available_proxy}")
+                            else:
+                                print(f"[PRE-BINDING] ❌ Failed to create binding for {session_name}")
+                        else:
+                            print(f"[PRE-BINDING] Using existing: {session_name} → {existing_binding}")
+                    else:
+                        # ❌ KHÔNG CHO PHÉP LOGIN KHÔNG PROXY!
+                        # Lý do: IP inconsistency → Account ban 100%
+                        print(f"[PRE-BINDING] ❌ ABORT: No healthy proxies available!")
+                        print(f"[PRE-BINDING] ❌ Cannot login without proxy - IP inconsistency = account ban!")
+                        print(f"[PRE-BINDING] ❌ Skipping account {account['id']}")
+                        continue  # Skip this account
+                except Exception as bind_error:
+                    print(f"[PRE-BINDING] ⚠️  Could not create pre-binding: {bind_error}")
+                
+                # Setup browser for this account (will use the binding we just created)
                 await fb_login.setup_browser(session_name, headless=headless)
                 
-                # Attempt login
+                # ❌ KHÔNG BAO GIỜ INJECT COOKIES CŨ!
+                # ✅ CHỈ DÙNG 2FA LOGIN - AN TOÀN 100%
+                # Lý do:
+                # 1. Cookies cũ đã expire → Failed login → Suspicions++
+                # 2. Cookie injection sau launch_persistent_context → Conflict
+                # 3. IP inconsistency (cookies từ IP A, request từ IP B) → Account ban
+                
+                print(f"[LOGIN] Starting REAL login for {account['id']} (2FA method - safest)")
+                login_success = False
+                
+                # Attempt REAL login via 2FA (no cookie shortcuts!)
                 if await fb_login.login_facebook(account):
-                    success_count += 1
-                    print(f"[SUCCESS] ✅ Account ID {account['id']} login successful")
-                    print(f"[SAVED] Session da duoc luu vao: sessions/{session_name}")
-                    
-                    # Update session status
-                    await fb_login.update_session_status(session_name)
+                    login_success = True
+                    print(f"[SUCCESS] Account ID {account['id']} login successful via 2FA")
                 else:
-                    print(f"[ERROR] ❌ Account ID {account['id']} login failed")
+                    print(f"[ERROR] Account ID {account['id']} login failed")
+                
+                if login_success:
+                    success_count += 1
+                    print(f"[SAVED] Session saved to: sessions/{session_name}")
+                    
+                    # Update session status (session_status.json + database)
+                    await fb_login.update_session_status(session_name, db_account_id=account.get('db_id'))
+                    
+                    # [FIX] AUTO-CREATE BINDING with proxy
+                    try:
+                        from core.session_proxy_binder import SessionProxyBinder
+                        from core.proxy_manager import ProxyManager
+                        
+                        # Initialize managers
+                        from core.database_manager import DatabaseManager
+                        db = DatabaseManager()
+                        binder = SessionProxyBinder(db_manager=db)
+                        proxy_mgr = ProxyManager(db_manager=db)
+                        
+                        # Get available healthy proxy IDs
+                        healthy_proxy_ids = proxy_mgr.get_healthy_proxy_ids(force_check=False)
+                        
+                        if healthy_proxy_ids:
+                            # ✅ FIX: Chọn proxy chưa được bind (tránh duplicate)
+                            all_bindings = binder.get_all_bindings()
+                            already_bound_proxies = set(all_bindings.values())
+                            
+                            # Tìm proxy chưa được bind
+                            available_proxy = None
+                            for proxy_candidate in healthy_proxy_ids:
+                                if proxy_candidate not in already_bound_proxies:
+                                    available_proxy = proxy_candidate
+                                    break
+                            
+                            # Fallback: nếu tất cả đã bind, reuse proxy (round-robin)
+                            if not available_proxy:
+                                available_proxy = healthy_proxy_ids[0]
+                                print(f"[BINDING] ⚠️  All proxies bound, reusing {available_proxy}")
+                            
+                            # ✅ FIX RACE: Use atomic method instead of direct cache access
+                            if binder.bind_session_atomic(session_name, available_proxy):
+                                print(f"[BINDING] ✅ Session {session_name} → {available_proxy}")
+                            else:
+                                print(f"[BINDING] ❌ Failed to bind {session_name}")
+                        else:
+                            print(f"[WARN] No healthy proxies available for binding")
+                    except Exception as bind_error:
+                        print(f"[WARN] Could not create binding: {bind_error}")
                 
                 # Close browser for this account
                 if fb_login.browser:
@@ -665,32 +986,32 @@ async def auto_login_from_file(account_file: str, account_index: Optional[int] =
         print("[RESULT] AUTO LOGIN SUMMARY")
         print("=" * 60)
         print(f"Total accounts processed: {len(accounts_to_process)}")
-        print(f"✅ Successful logins: {success_count - skipped_count}")
-        print(f"⏭️  Skipped (already valid): {skipped_count}")
-        print(f"❌ Failed: {len(accounts_to_process) - success_count}")
+        print(f"[OK] Successful logins: {success_count - skipped_count}")
+        print(f"[SKIP] Skipped (already valid): {skipped_count}")
+        print(f"[FAIL] Failed: {len(accounts_to_process) - success_count}")
         print("=" * 60)
         
         return success_count > 0
 
 
 def main():
-    """Main function với command line interface - ENHANCED for Docker"""
-    print("╔══════════════════════════════════════════════════════════════╗")
-    print("║        FACEBOOK POST MONITOR - ENTERPRISE EDITION           ║")
-    print("║           PHASE 3.0 - AUTO LOGIN WITH 2FA (ENHANCED)        ║")
-    print("║                                                              ║")
-    print("║  🤖 Tự động đăng nhập Facebook với 2FA authenticator        ║")
-    print("║  🔐 Tích hợp với session pool và proxy management           ║")
-    print("║  🐳 Docker-ready với skip existing sessions                 ║")
-    print("╚══════════════════════════════════════════════════════════════╝")
+    """Main function với command line interface - Production ready"""
+    print("=" * 70)
+    print("        FACEBOOK POST MONITOR - ENTERPRISE EDITION")
+    print("         PHASE 3.0 - AUTO LOGIN WITH 2FA (PRODUCTION)")
+    print("")
+    print("  Auto login Facebook with 2FA authenticator")
+    print("  Integrated with session pool and proxy management")
+    print("  VPS-optimized with skip existing sessions")
+    print("=" * 70)
     print()
     
     # Parse command line arguments
     # Usage: python auto_login.py [account.txt] [index|all] [headless] [skip_existing]
     account_file = "account.txt"
     account_index = None
-    headless = True  # ✅ Default to True for Docker compatibility
-    skip_existing = True  # ✅ Default skip existing for efficiency
+    headless = False  # ✅ FIX: Default False for anti-detection (use Xvfb on VPS)
+    skip_existing = True  # [OK] Default skip existing for efficiency
     
     if len(sys.argv) > 1:
         account_file = sys.argv[1]
@@ -703,7 +1024,7 @@ def main():
             try:
                 account_index = int(arg)
             except ValueError:
-                print(f"[ERROR] Account index phải là số hoặc 'all', nhận được: {arg}")
+                print(f"[ERROR] Account index must be a number or 'all', got: {arg}")
                 sys.exit(1)
     
     if len(sys.argv) > 3:
@@ -729,18 +1050,18 @@ def main():
         )
         
         if success:
-            print("\n🎉 Auto login hoàn thành!")
-            print("Bây giờ bạn có thể chạy các worker để sử dụng session này.")
+            print("\n[SUCCESS] Auto login completed!")
+            print("Now you can run workers to use this session.")
             sys.exit(0)  # Success exit code
         else:
-            print("\n❌ Auto login thất bại - không có session nào thành công!")
+            print("\n[FAIL] Auto login failed - no successful sessions!")
             sys.exit(1)  # Failure exit code
             
     except KeyboardInterrupt:
-        print("\n⏹️ Auto login bị hủy bởi người dùng.")
+        print("\n[CANCEL] Auto login cancelled by user.")
         sys.exit(130)  # Standard exit code for Ctrl+C
     except Exception as e:
-        print(f"\n💥 Lỗi: {e}")
+        print(f"\n[ERROR] Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)  # Error exit code

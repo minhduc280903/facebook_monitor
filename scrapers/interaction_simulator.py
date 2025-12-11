@@ -17,20 +17,28 @@ logger = get_logger(__name__)
 class InteractionSimulator:
     """Simulates human-like interactions to avoid bot detection."""
     
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, session_id: str = None):
         """
         Initialize InteractionSimulator
         
         Args:
             page: Playwright page instance
+            session_id: Optional session ID for per-session behavior variation
         """
         self.page = page
         
-        # Humanization settings
-        self.min_action_delay = 0.5
-        self.max_action_delay = 2.5
+        # ⚡ PER-SESSION PARETO ALPHA (anti-detection)
+        # Different sessions have slightly different behavior patterns
+        if session_id:
+            import hashlib
+            import random as random_module
+            seed = int(hashlib.md5(session_id.encode()).hexdigest()[:8], 16)
+            rng = random_module.Random(seed)
+            self.pareto_alpha = rng.uniform(1.2, 1.8)  # ✅ Unique per session
+        else:
+            self.pareto_alpha = 1.5  # Default fallback
         
-        logger.info("🤖 InteractionSimulator initialized")
+        logger.info(f"🤖 InteractionSimulator initialized (Pareto α={self.pareto_alpha:.2f})")
     
     async def random_mouse_movement(self) -> None:
         """
@@ -74,13 +82,15 @@ class InteractionSimulator:
         import asyncio
         
         try:
-            # Base delay
-            base_delay = random.uniform(self.min_action_delay, self.max_action_delay)
+            # ⚡ PARETO DELAY (anti-detection) - per-session alpha
+            # 80% delays: 0.3-1.5s (fast actions)
+            # 20% delays: 1.5-8s (long pauses)
+            base_delay = min(random.paretovariate(self.pareto_alpha) * 0.3, 8.0)
             
-            # Longer delays occasionally
-            if random.random() < 0.2:  # 20% chance
-                base_delay *= random.uniform(2.0, 4.0)
-                logger.debug(f"😴 Extended pause: {base_delay:.1f}s")
+            # Occasionally VERY long pause (like real user distracted)
+            if random.random() < 0.05:  # 5% chance (reduced from 20%)
+                base_delay *= random.uniform(3.0, 6.0)
+                logger.debug(f"😴 Extended pause (distracted): {base_delay:.1f}s")
             
             # Random interactions during delay
             if random.random() < 0.3:  # 30% chance
@@ -337,6 +347,104 @@ class InteractionSimulator:
         except Exception as e:
             logger.debug(f"❌ Error in random hover: {e}")
     
+    async def warmup_session(self, duration_range: tuple = (15, 25)) -> None:
+        """
+        🔥 WARMUP SESSION: Simulate normal browsing before scraping
+        
+        Purpose:
+        - Build behavioral fingerprint as "normal user"
+        - Avoid cold-start detection (new session immediately scraping = bot)
+        - Establish natural interaction patterns
+        
+        Activities:
+        - Random scrolling (2-5 times)
+        - Mouse movements (3-7 times)
+        - Occasional clicks on feed items (20% chance)
+        - Reading pauses (2-8s between actions)
+        
+        Args:
+            duration_range: Min/max warmup duration in seconds (default: 15-25s)
+        """
+        import random
+        import asyncio
+        
+        try:
+            warmup_duration = random.uniform(*duration_range)
+            logger.info(f"🔥 WARMUP: Starting {warmup_duration:.1f}s warmup session...")
+            
+            start_time = asyncio.get_event_loop().time()
+            end_time = start_time + warmup_duration
+            
+            # Random number of activities during warmup
+            num_scrolls = random.randint(2, 5)
+            num_mouse_moves = random.randint(3, 7)
+            
+            activities = []
+            
+            # Add scroll activities
+            for i in range(num_scrolls):
+                activities.append(('scroll', i))
+            
+            # Add mouse movement activities
+            for i in range(num_mouse_moves):
+                activities.append(('mouse', i))
+            
+            # Shuffle activities for natural randomness
+            random.shuffle(activities)
+            
+            # Execute activities with time constraint
+            for activity_type, activity_idx in activities:
+                # Check if we still have time
+                current_time = asyncio.get_event_loop().time()
+                if current_time >= end_time:
+                    break
+                
+                try:
+                    if activity_type == 'scroll':
+                        # Natural scroll amount
+                        scroll_amount = random.randint(300, 800)
+                        await self.page.mouse.wheel(0, scroll_amount)
+                        logger.debug(f"🔥 WARMUP: Scrolled {scroll_amount}px")
+                        
+                        # Pareto delay after scroll
+                        delay = min(random.paretovariate(self.pareto_alpha) * 0.5, 5.0)
+                        await asyncio.sleep(delay)
+                        
+                    elif activity_type == 'mouse':
+                        await self.random_mouse_movement()
+                        
+                        # Shorter delay after mouse movement
+                        delay = random.uniform(0.5, 2.0)
+                        await asyncio.sleep(delay)
+                        
+                        # 20% chance to click on something harmless
+                        if random.random() < 0.2:
+                            # Try to find and hover over a feed item (without clicking)
+                            try:
+                                feed_items = await self.page.query_selector_all('div[role="article"], div[role="feed"] > div')
+                                if feed_items and len(feed_items) > 0:
+                                    random_item = random.choice(feed_items[:5])  # Only top 5 to avoid scrolling
+                                    await random_item.hover()
+                                    logger.debug(f"🔥 WARMUP: Hovered over feed item")
+                                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                            except Exception:
+                                pass  # Ignore hover errors during warmup
+                    
+                except Exception as e:
+                    logger.debug(f"🔥 WARMUP: Minor error in activity: {e}")
+                    continue
+            
+            # Final reading pause before actual scraping
+            final_pause = random.uniform(2.0, 5.0)
+            await asyncio.sleep(final_pause)
+            
+            actual_duration = asyncio.get_event_loop().time() - start_time
+            logger.info(f"✅ WARMUP: Completed {actual_duration:.1f}s warmup session")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ WARMUP: Error during warmup (non-critical): {e}")
+            # Non-critical error, continue with scraping
+    
     async def get_interaction_stats(self) -> dict:
         """
         Get interaction statistics
@@ -346,6 +454,6 @@ class InteractionSimulator:
         """
         return {
             "simulator_active": True,
-            "min_action_delay": self.min_action_delay,
-            "max_action_delay": self.max_action_delay
+            "delay_distribution": "Pareto(alpha=1.5)",
+            "typical_delay_range": "0.3-1.5s (80%), 1.5-8s (20%)"
         }

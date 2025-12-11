@@ -7,7 +7,7 @@ Features:
 - Environment-based configuration with .env support
 - Type validation with Pydantic
 - Production/development profiles
-- Docker-friendly environment variable support
+- VPS Ubuntu deployment ready
 """
 
 import os
@@ -21,26 +21,26 @@ from pydantic import Field
 class DatabaseConfig(BaseSettings):
     """PostgreSQL database configuration settings"""
 
-    # PostgreSQL Configuration - Docker-aware
+    # PostgreSQL Configuration - Will be overridden by .env (DB_HOST, DB_USER, etc.)
     host: str = Field(
-        default="postgres",  # Docker service name (fallback localhost for local)
-        description="PostgreSQL server host"
+        default="localhost",
+        description="PostgreSQL server host (from .env: DB_HOST)"
     )
     port: int = Field(
         default=5432,
-        description="PostgreSQL server port"
+        description="PostgreSQL server port (from .env: DB_PORT)"
     )
     user: str = Field(
         default="postgres",
-        description="PostgreSQL username"
+        description="PostgreSQL username (from .env: DB_USER)"
     )
     password: str = Field(
         default="simple123",
-        description="PostgreSQL password"
+        description="PostgreSQL password (from .env: DB_PASSWORD)"
     )
     name: str = Field(
         default="facebook_monitor",
-        description="PostgreSQL database name"
+        description="PostgreSQL database name (from .env: DB_NAME)"
     )
     
     # Connection Settings
@@ -99,8 +99,8 @@ class WorkerConfig(BaseSettings):
     """Worker configuration settings"""
 
     headless: bool = Field(
-        default=True,
-        description="Run browser in headless mode"
+        default=False,  # ✅ ANTI-DETECTION: Use real Chrome with GUI on VPS
+        description="Run browser in headless mode (False = better anti-detection)"
     )
     concurrency: int = Field(
         default=0,
@@ -250,16 +250,16 @@ class RedisConfig(BaseSettings):
     """Redis configuration settings"""
 
     host: str = Field(
-        default="redis",  # Docker service name (fallback localhost for local)
-        description="Redis server host"
+        default="localhost",
+        description="Redis server host (from .env: REDIS_HOST)"
     )
     port: int = Field(
         default=6379,
-        description="Redis server port"
+        description="Redis server port (from .env: REDIS_PORT)"
     )
     db: int = Field(
         default=0,
-        description="Redis database number"
+        description="Redis database number (from .env: REDIS_DB)"
     )
     queue_name: str = Field(
         default="fb_scrape_tasks",
@@ -316,21 +316,21 @@ class TimeoutConfig(BaseSettings):
     
     # Human-like delays (anti-detection)
     warmup_delay_min: float = Field(
-        default=2.0,
+        default=30.0,  # ✅ HUMAN-LIKE: 30s minimum warmup
         description="Minimum warmup delay (seconds)"
     )
     warmup_delay_max: float = Field(
-        default=5.0,
+        default=60.0,  # ✅ HUMAN-LIKE: 60s maximum warmup
         description="Maximum warmup delay (seconds)"
     )
     
     # Scroll delays
     scroll_delay_min: float = Field(
-        default=0.5,
+        default=1.0,  # ✅ HUMAN-LIKE: 1s minimum (real users need time to read)
         description="Minimum scroll delay (seconds)"
     )
     scroll_delay_max: float = Field(
-        default=1.5,
+        default=3.0,  # ✅ HUMAN-LIKE: 3s maximum (simulate reading content)
         description="Maximum scroll delay (seconds)"
     )
     
@@ -355,18 +355,14 @@ class ScrapingConfig(BaseSettings):
         description="Maximum posts to process per page"
     )
     
-    # Unlimited scraping settings for date-based collection
-    unlimited_mode: bool = Field(
-        default=False,  # ⚡ TEMP: Disabled for testing extraction
-        description="Enable unlimited scraping based on start_date only"
-    )
+    # Date-based scraping settings (scroll until reaching start_date)
     max_posts_safety_limit: int = Field(
         default=999999,
-        description="Safety limit for posts when unlimited_mode=True"
+        description="Safety limit for posts (rarely reached, date filtering is primary stop)"
     )
-    max_scroll_hours: int = Field(
-        default=24,
-        description="Maximum hours to scroll when unlimited_mode=True"
+    max_scroll_hours: float = Field(
+        default=2.0,  # ✅ 2 hours safety limit - actual stop is date-based (scrape_since_date)
+        description="Maximum hours to scroll (safety limit, date filtering is primary stop)"
     )
     
     # Rate limiting to avoid Facebook detection/blocking
@@ -450,7 +446,7 @@ def get_production_config() -> Settings:
     production_config.environment = "production"
     production_config.debug = False
     production_config.log_level = "WARNING"
-    production_config.worker.headless = True
+    production_config.worker.headless = False  # ✅ FIX: Use GUI mode with Xvfb for anti-detection
     return production_config
 
 

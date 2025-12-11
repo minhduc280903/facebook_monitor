@@ -23,11 +23,17 @@ logger = get_logger(__name__)
 
 
 class CaptchaException(Exception):
-    """Exception raised when CAPTCHA is detected during scraping."""
+    """
+    Exception for CAPTCHA/Checkpoint detection - triggers PERMANENT quarantine
     
-    def __init__(self, message: str = "CAPTCHA detected", captcha_type: str = "unknown"):
+    When caught, BOTH session AND proxy should be quarantined permanently.
+    """
+    def __init__(self, message: str = "CAPTCHA detected", captcha_type: str = "unknown", 
+                 session_name: str = None, proxy_id: str = None):
         super().__init__(message)
         self.captcha_type = captcha_type
+        self.session_name = session_name
+        self.proxy_id = proxy_id
 
 
 class BrowserController:
@@ -67,23 +73,17 @@ class BrowserController:
                 logger.debug(f"🧭 Điều hướng đến: {url} (Lần thử {attempt + 1}/{retries})")
                 await self.page.goto(url, wait_until='domcontentloaded', timeout=45000)
                 
-                # CRITICAL: Check checkpoint FIRST (before CAPTCHA check)
-                # Checkpoint pages may contain CAPTCHA elements → false positive
-                checkpoint_resolved = False
+                # 🔒 CRITICAL: CHECKPOINT = PERMANENT QUARANTINE (NEVER try to resolve!)
                 if "checkpoint" in self.page.url:
-                    logger.warning("🔐 Facebook security checkpoint detected. Attempting to resolve...")
-                    checkpoint_resolved = await self.handle_checkpoint()
-                    if not checkpoint_resolved:
-                        logger.error("❌ Failed to resolve security checkpoint.")
-                        # Mark as CAPTCHA to quarantine proxy
-                        raise CaptchaException("Facebook security checkpoint - failed to resolve")
-                    logger.info("✅ Checkpoint resolved successfully. Continuing navigation...")
-                    # After resolving, wait a bit for potential redirect
-                    await asyncio.sleep(2)
+                    logger.critical(f"🚨 CHECKPOINT DETECTED - PERMANENT QUARANTINE: {self.page.url}")
+                    # ❌ NEVER try to resolve checkpoint - always quarantine!
+                    raise CaptchaException(
+                        "Facebook security checkpoint - PERMANENT QUARANTINE",
+                        captcha_type="checkpoint"
+                    )
                 
-                # Check for CAPTCHA ONLY if checkpoint was NOT resolved
-                # (If checkpoint resolved, we trust that content is accessible)
-                if not checkpoint_resolved and await self.is_captcha_present():
+                # Check for CAPTCHA (only if not checkpoint)
+                if await self.is_captcha_present():
                     logger.error("🛑 CAPTCHA detected after navigation")
                     raise CaptchaException("CAPTCHA present after navigation")
 

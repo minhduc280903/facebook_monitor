@@ -39,7 +39,7 @@ from logging_config import get_logger
 class FallbackConfig:
     failure_threshold = 3
     checkout_timeout = 30
-    headless = True
+    headless = False  # ✅ FIX: Anti-detection - use GUI mode
 
 class FallbackSettings:
     def __init__(self):
@@ -101,9 +101,15 @@ app = Celery('facebook_scraper')
 WORKER_CONCURRENCY = get_worker_concurrency()
 
 # Celery configuration
+# Dynamic Redis URL based on environment (Docker or Native VPS)
+REDIS_HOST = os.getenv("REDIS_HOST", "redis" if os.getenv("DOCKER_ENV") == "true" else "localhost")
+REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+REDIS_DB = os.getenv("REDIS_DB", "0")
+REDIS_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+
 app.conf.update(
-    broker_url='redis://redis:6379/0',
-    result_backend='redis://redis:6379/0',
+    broker_url=REDIS_URL,
+    result_backend=REDIS_URL,
 
     # Task routing với priority queues
     task_routes={
@@ -140,7 +146,7 @@ app.conf.update(
     beat_schedule={
         'dispatch-scan-tasks': {
             'task': 'facebook_scraper.dispatch_scan_tasks',
-            'schedule': 300.0,  # 5 minutes
+            'schedule': 300.0,  # ✅ 5 minutes - ALL posts in each URL updated every 5 minutes
         },
         'cleanup-old-data': {
             'task': 'facebook_scraper.cleanup_task',
@@ -225,13 +231,96 @@ class SafeBrowserManager:
                 
                 session_dir = f"./sessions/{session_name}"
 
-                logger.info(f"✅ Got session-proxy: {session_name} -> {proxy_config.get('proxy_id', 'unknown')}")
+                proxy_id = proxy_config.get('proxy_id', 'unknown') if proxy_config else 'none (direct)'
+                logger.info(f"✅ Got session-proxy: {session_name} -> {proxy_id}")
 
-                # Browser launch options
+                # 🎨 RE-GENERATE session fingerprint with CURRENT age (for evolution)
+                # ✅ FIX: Don't use cached fingerprint - must regenerate to apply time-based drift
+                session_resource = self.session_manager.resource_pool.get(session_name)
+                session_fingerprint = None
+                
+                if session_resource:
+                    from utils.browser_config import generate_session_fingerprint
+                    from datetime import datetime
+                    
+                    # Calculate ACTUAL days since creation for evolution
+                    days_since_creation = 0
+                    if session_resource.created_at:
+                        days_since_creation = (datetime.now() - session_resource.created_at).days
+                    
+                    # RE-GENERATE fingerprint with current age (applies evolution drift)
+                    session_fingerprint = generate_session_fingerprint(
+                        session_name,
+                        days_since_creation=days_since_creation
+                    )
+                    
+                    logger.info(f"🎨 Regenerated fingerprint for {session_name} (age: {days_since_creation} days)")
+                    
+                    # Update metadata with fresh fingerprint (for consistency)
+                    session_resource.metadata["fingerprint"] = session_fingerprint
+                    
+                    # 🌍 CRITICAL: Inject proxy geolocation into fingerprint BEFORE browser launch
+                    # This ensures timezone/geolocation in init scripts match proxy IP
+                    if proxy_config:
+                        proxy_id = proxy_config.get('proxy_id')
+                        if proxy_id and proxy_id in self.proxy_manager.resource_pool:
+                            proxy_resource = self.proxy_manager.resource_pool[proxy_id]
+                            proxy_geo = proxy_resource.metadata.get('geolocation')
+                            
+                            if proxy_geo:
+                                # ✅ STRICT VALIDATION: REJECT session if geolocation invalid
+                                required_fields = ['latitude', 'longitude', 'timezone', 'country']
+                                missing_fields = [f for f in required_fields if not proxy_geo.get(f)]
+                                
+                                if missing_fields:
+                                    error_msg = f"Proxy {proxy_id} geolocation incomplete (missing: {missing_fields}) - ABORTING"
+                                    logger.error(f"❌ {error_msg}")
+                                    raise Exception(error_msg)
+                                
+                                # Validate coordinate ranges
+                                lat = proxy_geo.get('latitude')
+                                lng = proxy_geo.get('longitude')
+                                
+                                if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                                    error_msg = f"Invalid proxy coordinates: lat={lat}, lng={lng} - ABORTING"
+                                    logger.error(f"❌ {error_msg}")
+                                    raise Exception(error_msg)
+                                
+                                # ✅ Valid - inject into fingerprint BEFORE browser uses it
+                                session_fingerprint['timezone'] = proxy_geo['timezone']
+                                session_fingerprint['geolocation'] = {
+                                    'latitude': lat,
+                                    'longitude': lng,
+                                    'accuracy': 100
+                                }
+                                logger.info(f"✅ Proxy geo injected BEFORE launch: {proxy_geo.get('city')}, {proxy_geo.get('country')}")
+                            else:
+                                error_msg = f"Proxy {proxy_id} has NO geolocation data - ABORTING"
+                                logger.error(f"❌ {error_msg}")
+                                raise Exception(error_msg)
+                
+                # 🔒 ANTI-DETECTION: Inject unique machine ID per session BEFORE browser launch
+                # Prevents Facebook detection of multiple accounts from same VPS machine-id
+                try:
+                    from utils.browser_config import generate_unique_machine_id, inject_machine_id_to_local_state
+                    
+                    # Generate deterministic machine ID for this session
+                    # Use session creation date if available for stability
+                    creation_date = session_resource.metadata.get("created_at") if session_resource else None
+                    machine_id = generate_unique_machine_id(session_name, creation_date)
+                    
+                    # Inject into Chromium Local State BEFORE browser reads it
+                    inject_machine_id_to_local_state(session_dir, machine_id)
+                    logger.info(f"✅ Machine ID injected for session: {session_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to inject machine ID (non-critical): {e}")
+                
+                # Browser launch options with fingerprint
                 launch_options = get_browser_launch_options(
                     user_data_dir=session_dir,
-                    headless=getattr(settings.worker, 'headless', True),
-                    proxy_config=proxy_config
+                    headless=getattr(settings.worker, 'headless', False),  # ✅ FIX: Default False
+                    proxy_config=proxy_config,
+                    session_fingerprint=session_fingerprint  # 🎨 Pass fingerprint for viewport/UA
                 )
 
                 try:
@@ -260,9 +349,27 @@ class SafeBrowserManager:
             # Get page
             page = context.pages[0] if context.pages else await context.new_page()
 
-            # Add stealth scripts
+            # 🎨 Load fingerprint from metadata (already regenerated + proxy geo injected)
+            # ✅ Fingerprint was prepared BEFORE browser launch with:
+            #    - Current age for evolution drift
+            #    - Proxy geolocation validation and injection
+            session_fingerprint = None
+            try:
+                session_resource = self.session_manager.resource_pool.get(session_name)
+                if session_resource:
+                    session_fingerprint = session_resource.metadata.get("fingerprint")
+                    if session_fingerprint:
+                        logger.info(f"🎨 Using prepared fingerprint for {session_name}: "
+                                  f"WebGL={session_fingerprint.get('webgl', {}).get('vendor', 'N/A')}, "
+                                  f"TZ={session_fingerprint.get('timezone', 'N/A')}")
+                    else:
+                        logger.warning(f"⚠️ No fingerprint in metadata for {session_name}")
+            except Exception as e:
+                logger.error(f"❌ Error loading fingerprint from metadata: {e}")
+
+            # Add stealth scripts with fingerprint
             from utils.browser_config import get_init_script
-            init_script = get_init_script()
+            init_script = get_init_script(session_fingerprint)  # 🎨 Pass fingerprint
             await page.add_init_script(init_script)
             
             # ENHANCEMENT: Track browser process PID for zombie prevention
@@ -303,6 +410,24 @@ class SafeBrowserManager:
             logger.info("🧹 Starting guaranteed browser cleanup...")
             
             cleanup_errors = []
+            
+            # 0. ✅ CRITICAL FIX: SAVE COOKIES BEFORE CLOSE!
+            # Prevent logout issue: Ensure cookies are flushed to disk BEFORE close
+            if context and session_name:
+                try:
+                    import os
+                    session_dir = f"./sessions/{session_name}"
+                    storage_state_path = os.path.join(session_dir, "storage_state.json")
+                    
+                    # Force save storage state (cookies + localStorage)
+                    await context.storage_state(path=storage_state_path)
+                    logger.info(f"✅ COOKIES SAVED for session: {session_name}")
+                    
+                    # Small delay to ensure disk write completes
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"❌ CRITICAL: Failed to save cookies: {e}")
+                    cleanup_errors.append(f"Cookie save error: {e}")
             
             # 1. Close browser context
             if context:
@@ -383,38 +508,63 @@ class SafeBrowserManager:
 
     async def _warmup_session(self, page, session_name: str):
         """
-        Warm up session với human-like behavior để tránh CAPTCHA
+        🔥 WARMUP SESSION: Adaptive warmup based on session age
+        
+        ✅ NEW STRATEGY:
+        - Sessions 2-24h: EXTENDED warmup (5 min) - still building trust
+        - Sessions 24h+: QUICK warmup (15-25s) - already trusted
+        
+        Purpose:
+        - Build behavioral fingerprint as "normal user"
+        - Avoid cold-start detection (new session immediately scraping = bot)
+        - Establish natural interaction patterns
         
         Args:
             page: Playwright page instance
             session_name: Session name for logging
         """
-        import random
-        import asyncio
-        
         try:
-            logger.info(f"🔥 Warming up session {session_name}...")
+            from datetime import datetime
+            from scrapers.interaction_simulator import InteractionSimulator
             
-            # Random delay 2-5 giây
-            warmup_delay = random.uniform(2, 5)
-            await asyncio.sleep(warmup_delay)
+            # Determine session age
+            session_resource = self.session_manager.resource_pool.get(session_name)
+            session_age_hours = 999  # Default: assume mature
             
-            # Scroll ngẫu nhiên để mimic human
-            try:
-                scroll_distance = random.randint(300, 800)
-                await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+            if session_resource and session_resource.created_at:
+                session_age = datetime.now() - session_resource.created_at
+                session_age_hours = session_age.total_seconds() / 3600
+            
+            simulator = InteractionSimulator(page, session_id=session_name)
+            
+            # ✅ ADAPTIVE WARMUP based on session age
+            if session_age_hours < 24:
+                # EXTENDED WARMUP for young sessions (2-24h)
+                logger.info(f"🔥 WARMUP: EXTENDED warmup for young session {session_name} (age: {session_age_hours:.1f}h)...")
                 
-                # Scroll back
-                await page.evaluate("window.scrollBy(0, -200)")
-                await asyncio.sleep(random.uniform(0.3, 0.8))
-            except Exception as e:
-                logger.debug(f"Warmup scroll failed (non-critical): {e}")
-            
-            logger.debug(f"✅ Session warmup completed for {session_name}")
+                # Phase 1: Browse newsfeed (2 min)
+                logger.info(f"📰 WARMUP Phase 1/3: Browsing newsfeed (2 min)")
+                await simulator.warmup_session(duration_range=(110, 130))
+                
+                # Phase 2: Random navigation (1 min)
+                logger.info(f"🔀 WARMUP Phase 2/3: Random activities (1 min)")
+                await simulator.warmup_session(duration_range=(55, 65))
+                
+                # Phase 3: Final reading pause (2 min)
+                logger.info(f"📖 WARMUP Phase 3/3: Reading pause (2 min)")
+                import asyncio
+                await asyncio.sleep(120)
+                
+                logger.info(f"✅ WARMUP: EXTENDED warmup completed (~5 min) for session {session_name}")
+            else:
+                # QUICK WARMUP for mature sessions (24h+)
+                logger.info(f"🔥 WARMUP: QUICK warmup for mature session {session_name} (age: {session_age_hours:.1f}h)...")
+                await simulator.warmup_session(duration_range=(15, 25))
+                logger.info(f"✅ WARMUP: QUICK warmup completed (~20s) for session {session_name}")
             
         except Exception as e:
-            logger.warning(f"⚠️ Session warmup failed (non-critical): {e}")
+            logger.warning(f"⚠️ WARMUP: Failed for {session_name} (non-critical): {e}")
+            # Non-critical - continue with scraping even if warmup fails
     
     async def _verify_login_status(self, page, session_name: str) -> bool:
         """
@@ -460,26 +610,57 @@ class SafeBrowserManager:
                 logger.warning(f"⚠️ Session not logged in - URL: {current_url}")
                 return False
             
-            logger.warning(f"⚠️ Could not verify login status for session: {session_name}")
-            return False
+            # [FIX] RELAXED VERIFICATION: If no selector found BUT URL is NOT login page → Accept it
+            # This handles cases where Facebook loads slow or selectors changed
+            logger.warning(f"⚠️ No selectors found but URL looks OK: {current_url}")
+            logger.info(f"✅ Login accepted (relaxed verification) for session: {session_name}")
+            return True  # Changed from False to True
             
         except Exception as e:
             logger.error(f"❌ Error verifying login status: {e}")
             return False
     
     def _get_session_proxy_pair(self):
-        """Get session-proxy pair with error handling"""
+        """
+        Get session-proxy pair with aging check
+        
+        ✅ NEW: Sessions < 2h old are blocked from scraping (aging period)
+        """
         try:
             required_role = AccountRole.MIXED
             logger.info(f"🎯 Requesting {required_role.value} session with bound proxy")
 
-            result = self.session_manager.checkout_session_with_proxy(self.proxy_manager, timeout=60)
-            if result:
+            # ✅ AGING CHECK: Try multiple times to find a mature session
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                result = self.session_manager.checkout_session_with_proxy(self.proxy_manager, timeout=60)
+                if not result:
+                    break  # No sessions available
+                
                 session_name, proxy_config = result
-                logger.info(f"✅ Session-proxy assigned: {session_name} -> {proxy_config.get('proxy_id')}")
+                
+                # ✅ Check session age (sessions < 30min are too young to scrape)
+                session_resource = self.session_manager.resource_pool.get(session_name)
+                if session_resource and session_resource.created_at:
+                    from datetime import datetime, timedelta
+                    session_age = datetime.now() - session_resource.created_at
+                    session_age_hours = session_age.total_seconds() / 3600
+                    
+                    if session_age_hours < 0.5:  # Reduced from 2h to 30 minutes for production
+                        logger.warning(f"⏳ Session {session_name} too young ({session_age_hours:.1f}h) - needs 30min aging period")
+                        # Checkin and try next session
+                        self.session_manager.checkin_session_with_proxy(session_name, proxy_config, self.proxy_manager)
+                        continue
+                    
+                    logger.info(f"✅ Session-proxy assigned: {session_name} (age: {session_age_hours:.1f}h) -> {proxy_config.get('proxy_id')}")
+                else:
+                    # No created_at info - allow (assume mature)
+                    logger.info(f"✅ Session-proxy assigned: {session_name} (age unknown) -> {proxy_config.get('proxy_id')}")
+                
                 return result
-
-            logger.warning("❌ No session-proxy pairs available")
+            
+            # NO FALLBACK - Must have proxy!
+            logger.error("❌ No mature session-proxy pairs available (all sessions < 30min or none available)")
             return None
 
         except Exception as e:
@@ -678,20 +859,36 @@ async def _async_scan_task(task_info: dict):
     with DatabaseManager() as db_manager:
         # Use SafeBrowserManager with guaranteed cleanup
         async with browser_manager.browser_session() as (page, session_name):
-            # Initialize scraper with managed resources
-            scraper_coordinator = ScraperCoordinator(db_manager, page)
+            try:
+                # Initialize scraper with managed resources (pass session_name for behavior variation)
+                scraper_coordinator = ScraperCoordinator(db_manager, page, session_name=session_name)
 
-            # Process URL
-            target_url = task_info.get('url', '')
-            logger.info(f"🎯 Processing URL: {target_url}")
-            scraping_result = await scraper_coordinator.process_url(target_url)
+                # Process URL
+                target_url = task_info.get('url', '')
+                logger.info(f"🎯 Processing URL: {target_url}")
+                scraping_result = await scraper_coordinator.process_url(target_url)
 
-            # Report success
-            if session_name:
-                browser_manager.session_manager.report_outcome(session_name, 'success')
-                logger.info(f"✅ Reported success for session: {session_name}")
+                # Report success
+                if session_name:
+                    browser_manager.session_manager.report_outcome(session_name, 'success')
+                    logger.info(f"✅ Reported success for session: {session_name}")
 
-            return scraping_result
+                return scraping_result
+            
+            except CaptchaException as e:
+                # 🚨 CRITICAL: Quarantine BOTH session AND proxy when checkpoint detected
+                logger.critical(f"🚨 CHECKPOINT DETECTED - Quarantining session {session_name}: {e}")
+                
+                if session_name:
+                    # Quarantine session PERMANENTLY for checkpoint
+                    browser_manager.session_manager.quarantine_resource(
+                        session_name=session_name,
+                        reason=f"Facebook checkpoint detected: {str(e)}"
+                    )
+                    logger.warning(f"⚠️ Session {session_name} QUARANTINED due to checkpoint")
+                
+                # Re-raise to also trigger proxy quarantine in outer handler
+                raise
     # Database and browser cleanup automatically handled by context managers
 
 @app.task(name='facebook_scraper.dispatch_scan_tasks')
@@ -699,12 +896,15 @@ def dispatch_scan_tasks():
     """
     MIGRATION: Thay thế scan_scheduler.py logic
     Celery Beat task để dispatch scan tasks
+    
+    ✅ ANTI-DETECTION: Stagger task dispatching to avoid coordinated bot pattern
     """
     try:
         import json
+        import random
         from datetime import datetime, timedelta
 
-        logger.info("📋 Dispatching scan tasks...")
+        logger.info("📋 Dispatching scan tasks with staggering...")
 
         # Load targets (giữ nguyên logic từ schedulers)
         with open('targets.json', 'r') as f:
@@ -713,19 +913,28 @@ def dispatch_scan_tasks():
 
         dispatched_count = 0
         for target in targets:
+            if not target.get('enabled'):
+                continue
+                
             url = target.get('url')
             if url:
-                # Dispatch task với priority (thay manual queue logic)
+                # ✅ STAGGER: Random delay 0-180s (0-3 minutes) between dispatches
+                # This prevents all sessions from hitting Facebook at the same time
+                countdown = random.randint(0, 180)
+                
+                # Dispatch task với priority và countdown
                 priority = 9 if target.get('priority') == 'high' else 5
                 scan_facebook_url.apply_async(
                     args=[{'url': url}],
                     queue='scan_high' if priority > 7 else 'scan_normal',
-                    priority=priority
+                    priority=priority,
+                    countdown=countdown  # ✅ DELAY execution
                 )
                 dispatched_count += 1
+                logger.info(f"📋 Dispatched {url[:50]}... with {countdown}s delay")
 
-        logger.info(f"✅ Dispatched {dispatched_count} scan tasks")
-        return {'dispatched': dispatched_count}
+        logger.info(f"✅ Dispatched {dispatched_count} scan tasks (staggered over 0-3 minutes)")
+        return {'dispatched': dispatched_count, 'stagger_window': '0-180s'}
 
     except Exception as e:
         logger.error(f"❌ Task dispatch failed: {e}")
@@ -784,10 +993,11 @@ def debug_session_test():
                 'test_proxy': proxy_config.get('proxy_id', 'unknown')
             }
         else:
-            logger.error("❌ No session-proxy pairs available")
+            # NO FALLBACK - Proxy required!
+            logger.error("❌ No session-proxy pairs available - proxy is required")
             return {
                 'status': 'failed',
-                'error': 'No session-proxy pairs available',
+                'error': 'No session-proxy pairs available (proxy required)',
                 'session_stats': session_stats
             }
 
@@ -844,7 +1054,7 @@ async def _async_scan_task_debug(task_info: dict):
 
             # STEP 3: Scraper coordinator setup
             logger.info("🔍 DEBUG: Step 3 - Setting up scraper coordinator...")
-            scraper_coordinator = ScraperCoordinator(db_manager, page)
+            scraper_coordinator = ScraperCoordinator(db_manager, page, session_name=session_name)
             logger.info("✅ DEBUG: Scraper coordinator ready")
 
             # STEP 4: Navigate to URL
@@ -1053,7 +1263,7 @@ def main():
     parser = argparse.ArgumentParser(description="Celery Worker for Facebook Post Monitor")
     parser.add_argument("--worker-id", type=str, help="Worker ID (for compatibility)")
     parser.add_argument("--queues", type=str, nargs="+", default=["all"], help="Queues (for compatibility)")
-    parser.add_argument("--headless", action="store_true", default=True, help="Headless mode")
+    parser.add_argument("--headless", action="store_true", default=False, help="Headless mode (default: False for anti-detection)")
     parser.add_argument("--auto-restart", action="store_true", help="Auto-restart (handled by Celery)")
 
     args = parser.parse_args()

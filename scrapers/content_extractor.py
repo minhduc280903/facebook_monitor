@@ -131,7 +131,7 @@ class ContentExtractor:
         """
         try:
             if strategy_type == 'css':
-                # 🐳 DOCKER FIX: Add wait for dynamic elements
+                # ⚡ FIX: Add wait for dynamic elements
                 if 'count' in field_name.lower():
                     try:
                         await element.wait_for_selector(strategy_path, timeout=3000)
@@ -162,7 +162,7 @@ class ContentExtractor:
                 return text.strip() if text else None
                 
             elif strategy_type == 'xpath':
-                # 🐳 DOCKER FIX: Add wait for XPath elements (reactions are often dynamic)
+                # ⚡ FIX: Add wait for XPath elements (reactions are often dynamic)
                 if 'count' in field_name.lower():
                     try:
                         await element.wait_for_selector(f"xpath={strategy_path}", timeout=3000)
@@ -366,37 +366,40 @@ class ContentExtractor:
     
     def _clean_post_url(self, url: str) -> str:
         """
-        Clean và normalize post URL
+        Clean và normalize post URL by removing ALL query parameters
         
         Args:
-            url: Raw URL
+            url: Raw URL (có thể có comment_id, __cft__, __tn__, etc.)
             
         Returns:
-            Cleaned URL
+            Clean post URL (chỉ giữ path, remove toàn bộ query parameters)
+            
+        Examples:
+            IN:  https://www.facebook.com/groups/OFFB.VN/posts/123/?comment_id=456
+            OUT: https://www.facebook.com/groups/OFFB.VN/posts/123/
+            
+            IN:  https://www.facebook.com/groups/OFFB.VN/posts/123/?__cft__[0]=...&__tn__=...
+            OUT: https://www.facebook.com/groups/OFFB.VN/posts/123/
         """
         if not url:
             return ""
-        
-        # Remove Facebook tracking parameters
-        tracking_params = [
-            '__cft__[0]', '__tn__', 'eid', 'hc_ref', 'fref',
-            '__xts__[0]', 'hc_location', 'fb_dtsg', 'jazoest'
-        ]
         
         # Convert relative URLs to absolute
         if url.startswith('/'):
             url = f"https://facebook.com{url}"
         
-        # Remove tracking parameters
-        for param in tracking_params:
-            if param in url:
-                url = re.sub(rf'[&?]{re.escape(param)}=[^&]*', '', url)
-        
-        # Clean up multiple consecutive separators
-        url = re.sub(r'[&?]+', lambda m: '?' if '?' in m.group() else '&', url)
-        url = url.rstrip('&?')
-        
-        return url
+        # ✅ Remove ALL query parameters using urlparse (cleaner approach)
+        try:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(url)
+            # Keep only: scheme, netloc, path - remove: params, query, fragment
+            clean_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+            return clean_url
+        except Exception as e:
+            # Fallback: manual removal if urlparse fails
+            if '?' in url:
+                url = url.split('?')[0]
+            return url
     
     async def extract_post_details(self, post_element) -> Optional[Dict[str, Any]]:
         """
@@ -575,3 +578,132 @@ class ContentExtractor:
             'failed_selectors_count': len(self.failed_selectors),
             'total_fields_tracked': len(self.strategy_stats)
         }
+    
+    # ============================================================================
+    # ✅ POST TYPE DETECTION - Using selectors.json strategies
+    # ============================================================================
+    
+    async def detect_post_type(self, post_element) -> str:
+        """
+        Detect post type: VIDEO, PHOTO, TEXT, or LINK.
+        
+        ✅ SAFE: Uses existing selectors.json strategies, no side effects
+        
+        Args:
+            post_element: Playwright element of the post
+            
+        Returns:
+            Post type string: "VIDEO", "PHOTO", "TEXT", or "LINK"
+            
+        Strategy:
+            1. Check for video elements (highest priority)
+            2. Check for photo/image elements
+            3. Check for external links
+            4. Default to TEXT
+        """
+        try:
+            # Strategy 1: Check for VIDEO
+            video_result = await self.extract_data(post_element, 'post_type_video')
+            if video_result:
+                logger.debug("✅ Detected post type: VIDEO")
+                return "VIDEO"
+            
+            # Strategy 2: Check for PHOTO
+            photo_result = await self.extract_data(post_element, 'post_type_photo')
+            if photo_result:
+                logger.debug("✅ Detected post type: PHOTO")
+                return "PHOTO"
+            
+            # Strategy 3: Check for LINK (external)
+            link_result = await self.extract_data(post_element, 'post_type_link')
+            if link_result:
+                logger.debug("✅ Detected post type: LINK")
+                return "LINK"
+            
+            # Default: TEXT post
+            logger.debug("✅ Detected post type: TEXT (default)")
+            return "TEXT"
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error detecting post type: {e}")
+            return "TEXT"  # Safe fallback
+    
+    # ============================================================================
+    # ✅ POST STATUS DETECTION
+    # ============================================================================
+    
+    async def detect_post_status(self, post_element, post_age_hours: Optional[float] = None) -> str:
+        """
+        Detect post status: ACTIVE, DEAD, or STALE.
+        
+        ✅ SAFE: Read-only checks, no modifications
+        
+        Args:
+            post_element: Playwright element of the post
+            post_age_hours: Age of post in hours (optional, for STALE detection)
+            
+        Returns:
+            Post status string: "ACTIVE", "DEAD", or "STALE"
+            
+        Strategy:
+            1. Check for "content not available" messages → DEAD
+            2. Check for removed/hidden indicators → DEAD
+            3. Check post age vs activity → STALE
+            4. Default to ACTIVE
+        """
+        try:
+            # Strategy 1: Check for "content unavailable" messages
+            dead_indicators = [
+                "This content isn't available",
+                "Content not found",
+                "Nội dung không có sẵn",
+                "Nội dung không tồn tại",
+                "Bài viết đã bị xóa",
+                "This post has been removed",
+                "Sorry, this content isn't available"
+            ]
+            
+            # Get all text in post element
+            try:
+                post_text = await post_element.inner_text()
+                post_text_lower = post_text.lower() if post_text else ""
+                
+                for indicator in dead_indicators:
+                    if indicator.lower() in post_text_lower:
+                        logger.debug(f"✅ Detected DEAD post: Found indicator '{indicator}'")
+                        return "DEAD"
+            except Exception as e:
+                logger.debug(f"Could not get post text for status check: {e}")
+            
+            # Strategy 2: Check for hidden/removed elements
+            try:
+                # Check for common "removed" selectors
+                removed_selectors = [
+                    "[data-removed='true']",
+                    ".removed_post",
+                    "[aria-label*='removed']",
+                    "[aria-label*='unavailable']"
+                ]
+                
+                for selector in removed_selectors:
+                    removed_element = await post_element.query_selector(selector)
+                    if removed_element:
+                        logger.debug(f"✅ Detected DEAD post: Found removed element '{selector}'")
+                        return "DEAD"
+            except Exception as e:
+                logger.debug(f"Error checking removed selectors: {e}")
+            
+            # Strategy 3: Check for STALE (old with no recent activity)
+            if post_age_hours is not None and post_age_hours > 168:  # > 7 days
+                # Try to get recent interaction data to confirm staleness
+                # If post is > 7 days old, mark as STALE
+                logger.debug(f"✅ Detected STALE post: Age {post_age_hours:.1f}h (>168h)")
+                return "STALE"
+            
+            # Default: ACTIVE
+            logger.debug("✅ Detected post status: ACTIVE")
+            return "ACTIVE"
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Error detecting post status: {e}")
+            return "ACTIVE"  # Safe fallback - assume active

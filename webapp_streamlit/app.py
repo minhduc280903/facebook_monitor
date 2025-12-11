@@ -116,8 +116,8 @@ def load_top_viral_posts(limit=10, apply_quality_filter=False):
 def load_broken_selectors():
     """Load broken selectors from Redis"""
     try:
-        # Read Redis config from environment variables for Docker compatibility
-        redis_host = os.getenv('REDIS_HOST', 'redis')
+        # Read Redis config from environment variables
+        redis_host = os.getenv('REDIS_HOST', 'localhost')
         redis_port = int(os.getenv('REDIS_PORT', 6379))
         redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
         

@@ -15,6 +15,7 @@ Chịu trách nhiệm:
 # Add project root to Python path for imports
 import sys
 import os
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
@@ -166,7 +167,9 @@ class DatabaseManager:
                     first_seen_utc TEXT NOT NULL,
                     tracking_expires_utc TEXT NOT NULL,
                     status TEXT DEFAULT 'TRACKING'
-                        CHECK(status IN ('TRACKING', 'EXPIRED'))
+                        CHECK(status IN ('TRACKING', 'EXPIRED')),
+                    post_type VARCHAR(20) DEFAULT 'TEXT',
+                    post_status VARCHAR(20) DEFAULT 'ACTIVE'
                 )
                 """
 
@@ -191,9 +194,83 @@ class DatabaseManager:
                 )
                 """
 
+                # ===== BẢNG PROXIES - QUẢN LÝ PROXY CENTRALIZED =====
+                proxies_table_sql = """
+                CREATE TABLE IF NOT EXISTS proxies (
+                    id SERIAL PRIMARY KEY,
+                    host VARCHAR(255) NOT NULL,
+                    port INTEGER NOT NULL,
+                    username VARCHAR(255),
+                    password VARCHAR(255),
+                    proxy_type VARCHAR(20) DEFAULT 'http' 
+                        CHECK(proxy_type IN ('http', 'https', 'socks5')),
+                    
+                    status VARCHAR(20) DEFAULT 'READY'
+                        CHECK(status IN ('READY', 'IN_USE', 'QUARANTINED', 'FAILED', 'DISABLED', 'TESTING')),
+                    consecutive_failures INTEGER DEFAULT 0,
+                    total_tasks INTEGER DEFAULT 0,
+                    successful_tasks INTEGER DEFAULT 0,
+                    success_rate FLOAT DEFAULT 1.0,
+                    
+                    last_checked_at TIMESTAMP,
+                    response_time FLOAT,
+                    geolocation JSONB,
+                    
+                    quarantine_reason TEXT,
+                    quarantine_count INTEGER DEFAULT 0,
+                    quarantine_until TIMESTAMP,
+                    
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    last_used_at TIMESTAMP,
+                    
+                    UNIQUE(host, port)
+                )
+                """
+
+                # ===== BẢNG ACCOUNTS - QUẢN LÝ FACEBOOK ACCOUNTS =====
+                accounts_table_sql = """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id SERIAL PRIMARY KEY,
+                    
+                    -- Facebook credentials
+                    facebook_id VARCHAR(50) UNIQUE NOT NULL,
+                    email VARCHAR(255),
+                    password TEXT,
+                    totp_secret VARCHAR(100),
+                    cookies TEXT,
+                    access_token TEXT,
+                    
+                    -- Session linking
+                    session_folder VARCHAR(100),
+                    session_status VARCHAR(20) DEFAULT 'NOT_CREATED'
+                        CHECK(session_status IN ('NOT_CREATED', 'CREATING', 'LOGGED_IN', 'NEEDS_LOGIN', 'FAILED')),
+                    last_login_at TIMESTAMP,
+                    login_attempts INTEGER DEFAULT 0,
+                    
+                    -- Proxy binding
+                    proxy_id INTEGER REFERENCES proxies(id) ON DELETE SET NULL,
+                    
+                    -- Metadata
+                    user_agent TEXT,
+                    additional_data JSONB,
+                    
+                    -- Status
+                    status VARCHAR(20) DEFAULT 'ACTIVE'
+                        CHECK(status IN ('ACTIVE', 'INACTIVE', 'BANNED', 'CHECKPOINT')),
+                    is_active BOOLEAN DEFAULT TRUE,
+                    
+                    -- Timestamps
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+
                 cursor.execute(posts_table_sql)
                 cursor.execute(interactions_table_sql)
                 cursor.execute(system_settings_table_sql)
+                cursor.execute(proxies_table_sql)
+                cursor.execute(accounts_table_sql)
 
                 # ===== TẠO INDEX ĐỂ TĂNG TỐC TRUY VẤN =====
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
@@ -201,6 +278,17 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_posts_first_seen ON posts(first_seen_utc)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_interactions_post_signature ON interactions(post_signature)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(log_timestamp_utc)")
+                
+                # ===== PROXY TABLE INDEXES =====
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_proxies_success_rate ON proxies(success_rate DESC)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_proxies_quarantine_until ON proxies(quarantine_until)")
+                
+                # ===== ACCOUNT TABLE INDEXES =====
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_facebook_id ON accounts(facebook_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_session_status ON accounts(session_status)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_is_active ON accounts(is_active)")
                 
                 # ===== ADD UNIQUE CONSTRAINT TO PREVENT DUPLICATES =====
                 # Unique constraint on (post_signature, log_timestamp_utc) to prevent
@@ -275,8 +363,22 @@ class DatabaseManager:
             logger.error(f"❌ Batch signature check failed: {e}")
             return set()
 
-    def add_new_post(self, post_signature: str, post_url: str, source_url: str, author_name: Optional[str] = None, author_id: Optional[str] = None, post_content: Optional[str] = None) -> bool:
-        """Thêm bài viết mới vào bảng posts với thông tin chi tiết và retry logic."""
+    def add_new_post(
+        self, 
+        post_signature: str, 
+        post_url: str, 
+        source_url: str, 
+        author_name: Optional[str] = None, 
+        author_id: Optional[str] = None, 
+        post_content: Optional[str] = None,
+        post_type: str = 'TEXT',
+        post_status: str = 'ACTIVE'
+    ) -> bool:
+        """
+        Thêm bài viết mới vào bảng posts với thông tin chi tiết và retry logic.
+        
+        ✅ NEW: Supports post_type (VIDEO/PHOTO/TEXT/LINK) and post_status (ACTIVE/DEAD/STALE)
+        """
         now_utc = datetime.now(timezone.utc)
         tracking_days = settings.scraping.post_tracking_days
         expires_utc = now_utc + timedelta(days=tracking_days)
@@ -284,8 +386,8 @@ class DatabaseManager:
         tracking_expires_utc = expires_utc.isoformat()
 
         sql = """
-        INSERT INTO posts (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'TRACKING')
+        INSERT INTO posts (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, status, post_type, post_status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'TRACKING', %s, %s)
         """
         
         # 🔄 FIX: Retry logic cho transient errors
@@ -296,8 +398,9 @@ class DatabaseManager:
             try:
                 with self.get_connection() as conn:
                     with conn.cursor() as cursor:
-                        cursor.execute(sql, (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc))
-                logger.info("✅ Post added: %s... (expires: %s)", post_signature[:30], expires_utc.strftime('%Y-%m-%d %H:%M'))
+                        cursor.execute(sql, (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, post_type, post_status))
+                logger.info("✅ Post added: %s... (expires: %s, type=%s, status=%s)", 
+                           post_signature[:30], expires_utc.strftime('%Y-%m-%d %H:%M'), post_type, post_status)
                 return True
                 
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
@@ -330,13 +433,45 @@ class DatabaseManager:
         except Exception as e:
             logger.error("❌ Lỗi lấy thông tin post: %s", e)
             return None
+    
+    def _get_latest_interaction(self, post_signature: str) -> Optional[Dict[str, Any]]:
+        """
+        Lấy interaction mới nhất của một post (để validate data).
+        
+        Args:
+            post_signature: Signature của post
+            
+        Returns:
+            Dict chứa interaction cuối cùng hoặc None nếu chưa có
+        """
+        sql = """
+        SELECT like_count, comment_count, log_timestamp_utc
+        FROM interactions
+        WHERE post_signature = %s
+        ORDER BY log_timestamp_utc DESC
+        LIMIT 1
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (post_signature,))
+                    result = cursor.fetchone()
+                    return dict(result) if result else None
+        except Exception as e:
+            logger.debug(f"Could not get latest interaction for {post_signature[:30]}: {e}")
+            return None
 
     def log_interaction(self, post_signature: str, log_timestamp_utc: str, like_count: int, comment_count: int) -> bool:
         """
-        Ghi log tương tác vào bảng interactions với duplicate prevention và retry logic.
+        Ghi log tương tác vào bảng interactions với duplicate prevention, retry logic và data validation.
         
         FIX: Sử dụng exact timestamp (không round) để tránh collision.
         ON CONFLICT DO UPDATE xử lý gracefully nếu có retry với cùng timestamp.
+        
+        ✅ DATA VALIDATION:
+        - Không lưu nếu scrape fail (like_count=0 và comment_count=0 khi có data cũ > 0)
+        - Không lưu nếu giảm bất thường (>2 so với lần trước)
+        - Like/comment chỉ nên tăng, giảm nhỏ là OK
         
         Args:
             post_signature: Signature của post
@@ -345,7 +480,7 @@ class DatabaseManager:
             comment_count: Số lượng comments
             
         Returns:
-            True nếu ghi thành công, False nếu có lỗi
+            True nếu ghi thành công, False nếu có lỗi hoặc data invalid
         """
         # ✅ FIX: Use exact timestamp - no rounding to prevent collision
         # Each interaction gets unique timestamp for better chart granularity
@@ -357,6 +492,36 @@ class DatabaseManager:
         except Exception as e:
             logger.warning("⚠️ Error parsing timestamp, using original: %s", e)
             exact_timestamp = log_timestamp_utc
+        
+        # ✅ DATA VALIDATION: Get last interaction để validate
+        last_interaction = self._get_latest_interaction(post_signature)
+        
+        if last_interaction:
+            last_likes = last_interaction.get('like_count', 0) or 0
+            last_comments = last_interaction.get('comment_count', 0) or 0
+            
+            # Rule 1: Nếu scrape fail (cả 2 về 0) mà trước đó có data → skip
+            if like_count == 0 and comment_count == 0 and (last_likes > 0 or last_comments > 0):
+                logger.warning(f"⚠️ Skip invalid data for {post_signature[:30]}: got 0/0 but last was {last_likes}/{last_comments}")
+                return False
+            
+            # Rule 2: Không cho giảm quá nhiều (>2)
+            likes_delta = like_count - last_likes
+            comments_delta = comment_count - last_comments
+            
+            if likes_delta < -2:
+                logger.warning(f"⚠️ Skip abnormal decrease in likes for {post_signature[:30]}: {last_likes} -> {like_count} (delta: {likes_delta})")
+                return False
+            
+            if comments_delta < -2:
+                logger.warning(f"⚠️ Skip abnormal decrease in comments for {post_signature[:30]}: {last_comments} -> {comment_count} (delta: {comments_delta})")
+                return False
+            
+            # Rule 3: Log warning nếu giảm nhẹ (1-2) nhưng vẫn cho phép
+            if likes_delta < 0:
+                logger.debug(f"📉 Minor decrease in likes for {post_signature[:30]}: {last_likes} -> {like_count} (delta: {likes_delta})")
+            if comments_delta < 0:
+                logger.debug(f"📉 Minor decrease in comments for {post_signature[:30]}: {last_comments} -> {comment_count} (delta: {comments_delta})")
         
         # Use ON CONFLICT DO UPDATE for retry safety
         # If exact same timestamp (rare due to no rounding), update values
@@ -466,8 +631,24 @@ class DatabaseManager:
             logger.error(f"❌ Batch interaction logging failed: {e}")
             return 0
 
-    def add_new_post_with_interaction(self, post_signature: str, post_url: str, source_url: str, like_count: int, comment_count: int, author_name: Optional[str] = None, author_id: Optional[str] = None, post_content: Optional[str] = None) -> bool:
-        """Thêm post mới và interaction đầu tiên trong một transaction duy nhất."""
+    def add_new_post_with_interaction(
+        self, 
+        post_signature: str, 
+        post_url: str, 
+        source_url: str, 
+        like_count: int, 
+        comment_count: int, 
+        author_name: Optional[str] = None, 
+        author_id: Optional[str] = None, 
+        post_content: Optional[str] = None,
+        post_type: str = 'TEXT',
+        post_status: str = 'ACTIVE'
+    ) -> bool:
+        """
+        Thêm post mới và interaction đầu tiên trong một transaction duy nhất.
+        
+        ✅ NEW: Supports post_type (VIDEO/PHOTO/TEXT/LINK) and post_status (ACTIVE/DEAD/STALE)
+        """
         now_utc = datetime.now(timezone.utc)
         tracking_days = settings.scraping.post_tracking_days
         expires_utc = now_utc + timedelta(days=tracking_days)
@@ -475,8 +656,8 @@ class DatabaseManager:
         tracking_expires_utc = expires_utc.isoformat()
 
         post_sql = """
-        INSERT INTO posts (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'TRACKING')
+        INSERT INTO posts (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, status, post_type, post_status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'TRACKING', %s, %s)
         """
         interaction_sql = """
         INSERT INTO interactions (post_signature, log_timestamp_utc, like_count, comment_count)
@@ -485,9 +666,10 @@ class DatabaseManager:
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(post_sql, (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc))
+                    cursor.execute(post_sql, (post_signature, post_url, source_url, author_name, author_id, post_content, first_seen_utc, tracking_expires_utc, post_type, post_status))
                     cursor.execute(interaction_sql, (post_signature, first_seen_utc, like_count, comment_count))
-            logger.info("✅ Atomic dual-stream: post + interaction added for %s... (%d likes, %d comments)", post_signature[:30], like_count, comment_count)
+            logger.info("✅ Atomic dual-stream: post + interaction added for %s... (%d likes, %d comments, type=%s, status=%s)", 
+                       post_signature[:30], like_count, comment_count, post_type, post_status)
             return True
         except Exception as e:
             logger.error(f"❌ Lỗi atomic add_new_post_with_interaction: {e}")
@@ -732,6 +914,287 @@ class DatabaseManager:
     def _get_placeholder(self) -> str:
         """Return database placeholder for PostgreSQL."""
         return DB_PLACEHOLDER_POSTGRES
+    
+    # ===== PROXY MANAGEMENT METHODS =====
+    
+    def add_proxy(self, host: str, port: int, username: str = None, 
+                  password: str = None, proxy_type: str = 'http') -> Optional[int]:
+        """
+        Thêm proxy mới vào database
+        
+        Returns:
+            proxy_id nếu thành công, None nếu lỗi
+        """
+        sql = """
+        INSERT INTO proxies (host, port, username, password, proxy_type, status)
+        VALUES (%s, %s, %s, %s, %s, 'READY')
+        ON CONFLICT (host, port) DO NOTHING
+        RETURNING id
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (host, port, username, password, proxy_type))
+                    result = cursor.fetchone()
+                    if result:
+                        proxy_id = result['id']
+                        logger.info(f"✅ Proxy added: {host}:{port} (ID: {proxy_id})")
+                        return proxy_id
+                    else:
+                        logger.warning(f"⚠️ Proxy already exists: {host}:{port}")
+                        return None
+        except Exception as e:
+            logger.error(f"❌ Error adding proxy: {e}")
+            return None
+
+    def get_all_proxies(self, status_filter: Optional[str] = None) -> List[Dict]:
+        """Lấy tất cả proxies từ database"""
+        if status_filter:
+            sql = "SELECT * FROM proxies WHERE status = %s ORDER BY id"
+            params = (status_filter,)
+        else:
+            sql = "SELECT * FROM proxies ORDER BY id"
+            params = ()
+        
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, params)
+                    proxies = [dict(row) for row in cursor.fetchall()]
+                    logger.debug(f"📊 Retrieved {len(proxies)} proxies from DB")
+                    return proxies
+        except Exception as e:
+            logger.error(f"❌ Error fetching proxies: {e}")
+            return []
+
+    def update_proxy_status(self, proxy_id: int, status: str, 
+                           metadata: Optional[Dict] = None) -> bool:
+        """Update proxy status và metadata"""
+        sql = """
+        UPDATE proxies 
+        SET status = %s, 
+            updated_at = NOW(),
+            consecutive_failures = COALESCE(%s, consecutive_failures),
+            total_tasks = COALESCE(%s, total_tasks),
+            successful_tasks = COALESCE(%s, successful_tasks),
+            success_rate = COALESCE(%s, success_rate),
+            last_checked_at = COALESCE(%s::timestamp, last_checked_at),
+            response_time = COALESCE(%s, response_time),
+            geolocation = COALESCE(%s::jsonb, geolocation),
+            quarantine_reason = COALESCE(%s, quarantine_reason),
+            quarantine_until = COALESCE(%s::timestamp, quarantine_until),
+            last_used_at = COALESCE(%s::timestamp, last_used_at)
+        WHERE id = %s
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (
+                        status,
+                        metadata.get('consecutive_failures') if metadata else None,
+                        metadata.get('total_tasks') if metadata else None,
+                        metadata.get('successful_tasks') if metadata else None,
+                        metadata.get('success_rate') if metadata else None,
+                        metadata.get('last_checked_at') if metadata else None,
+                        metadata.get('response_time') if metadata else None,
+                        json.dumps(metadata.get('geolocation')) if metadata and metadata.get('geolocation') else None,
+                        metadata.get('quarantine_reason') if metadata else None,
+                        metadata.get('quarantine_until').isoformat() if metadata and metadata.get('quarantine_until') else None,
+                        metadata.get('last_used_at').isoformat() if metadata and metadata.get('last_used_at') else None,
+                        proxy_id
+                    ))
+                    logger.debug(f"✅ Updated proxy {proxy_id} status to {status}")
+                    return True
+        except Exception as e:
+            logger.error(f"❌ Error updating proxy {proxy_id}: {e}")
+            return False
+
+    def delete_proxy(self, proxy_id: int) -> bool:
+        """Xóa proxy khỏi database"""
+        sql = "DELETE FROM proxies WHERE id = %s"
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (proxy_id,))
+                    logger.info(f"🗑️ Deleted proxy {proxy_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"❌ Error deleting proxy {proxy_id}: {e}")
+            return False
+
+    def get_proxy_by_id(self, proxy_id: int) -> Optional[Dict]:
+        """Lấy proxy theo ID"""
+        sql = "SELECT * FROM proxies WHERE id = %s"
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (proxy_id,))
+                    result = cursor.fetchone()
+                    return dict(result) if result else None
+        except Exception as e:
+            logger.error(f"❌ Error fetching proxy {proxy_id}: {e}")
+            return None
+    
+    # ===== ACCOUNT MANAGEMENT METHODS =====
+    
+    def add_account(self, facebook_id: str, email: str = None, password: str = None,
+                   totp_secret: str = None, cookies: str = None, access_token: str = None,
+                   additional_data: Dict = None) -> Optional[int]:
+        """
+        Thêm account mới vào database
+        
+        Returns:
+            account_id nếu thành công, None nếu lỗi
+        """
+        sql = """
+        INSERT INTO accounts (facebook_id, email, password, totp_secret, cookies, access_token, additional_data, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, 'ACTIVE')
+        ON CONFLICT (facebook_id) DO NOTHING
+        RETURNING id
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (
+                        facebook_id, email, password, totp_secret, cookies, access_token,
+                        json.dumps(additional_data) if additional_data else None
+                    ))
+                    result = cursor.fetchone()
+                    if result:
+                        account_id = result['id']
+                        logger.info(f"✅ Account added: {facebook_id} (ID: {account_id})")
+                        return account_id
+                    else:
+                        logger.warning(f"⚠️ Account already exists: {facebook_id}")
+                        return None
+        except Exception as e:
+            logger.error(f"❌ Error adding account: {e}")
+            return None
+    
+    def get_all_accounts(self, status_filter: Optional[str] = None, 
+                        is_active: Optional[bool] = None) -> List[Dict]:
+        """Lấy tất cả accounts từ database"""
+        conditions = []
+        params = []
+        
+        if status_filter:
+            conditions.append("status = %s")
+            params.append(status_filter)
+        
+        if is_active is not None:
+            conditions.append("is_active = %s")
+            params.append(is_active)
+        
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        sql = f"SELECT * FROM accounts{where_clause} ORDER BY id"
+        
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, tuple(params))
+                    accounts = [dict(row) for row in cursor.fetchall()]
+                    logger.debug(f"📊 Retrieved {len(accounts)} accounts from DB")
+                    return accounts
+        except Exception as e:
+            logger.error(f"❌ Error fetching accounts: {e}")
+            return []
+    
+    def get_account_by_id(self, account_id: int) -> Optional[Dict]:
+        """Lấy account theo ID"""
+        sql = "SELECT * FROM accounts WHERE id = %s"
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (account_id,))
+                    result = cursor.fetchone()
+                    return dict(result) if result else None
+        except Exception as e:
+            logger.error(f"❌ Error fetching account {account_id}: {e}")
+            return None
+    
+    def get_account_by_facebook_id(self, facebook_id: str) -> Optional[Dict]:
+        """Lấy account theo Facebook ID"""
+        sql = "SELECT * FROM accounts WHERE facebook_id = %s"
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (facebook_id,))
+                    result = cursor.fetchone()
+                    return dict(result) if result else None
+        except Exception as e:
+            logger.error(f"❌ Error fetching account {facebook_id}: {e}")
+            return None
+    
+    def update_account_session(self, account_id: int, session_folder: str = None,
+                              session_status: str = None, last_login_at: datetime = None,
+                              login_attempts: int = None) -> bool:
+        """Update account session info sau khi login"""
+        sql = """
+        UPDATE accounts 
+        SET updated_at = NOW(),
+            session_folder = COALESCE(%s, session_folder),
+            session_status = COALESCE(%s, session_status),
+            last_login_at = COALESCE(%s, last_login_at),
+            login_attempts = COALESCE(%s, login_attempts)
+        WHERE id = %s
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (
+                        session_folder, session_status, last_login_at, login_attempts, account_id
+                    ))
+                    logger.debug(f"✅ Updated account {account_id} session info")
+                    return True
+        except Exception as e:
+            logger.error(f"❌ Error updating account {account_id}: {e}")
+            return False
+    
+    def update_account_proxy(self, account_id: int, proxy_id: int) -> bool:
+        """Bind account với proxy"""
+        sql = "UPDATE accounts SET proxy_id = %s, updated_at = NOW() WHERE id = %s"
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (proxy_id, account_id))
+                    logger.debug(f"✅ Bound account {account_id} to proxy {proxy_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"❌ Error binding account {account_id} to proxy: {e}")
+            return False
+    
+    def update_account_status(self, account_id: int, status: str, 
+                            is_active: bool = None) -> bool:
+        """Update account status"""
+        sql = """
+        UPDATE accounts 
+        SET status = %s,
+            is_active = COALESCE(%s, is_active),
+            updated_at = NOW()
+        WHERE id = %s
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (status, is_active, account_id))
+                    logger.debug(f"✅ Updated account {account_id} status to {status}")
+                    return True
+        except Exception as e:
+            logger.error(f"❌ Error updating account {account_id} status: {e}")
+            return False
+    
+    def delete_account(self, account_id: int) -> bool:
+        """Xóa account khỏi database"""
+        sql = "DELETE FROM accounts WHERE id = %s"
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (account_id,))
+                    logger.info(f"🗑️ Deleted account {account_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"❌ Error deleting account {account_id}: {e}")
+            return False
 
     def close(self) -> None:
         """Đóng toàn bộ connection pool."""

@@ -33,6 +33,7 @@ class Target:
         self.enabled = data.get("enabled", True)
         self.priority = data.get("priority", "medium")  # high, medium, low
         self.notes = data.get("notes", "")
+        self.last_scraped = data.get("last_scraped", None)  # ✅ FIX: Add missing attribute
         
         # Validation
         if not self.url or not self.id:

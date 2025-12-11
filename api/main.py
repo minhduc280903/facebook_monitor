@@ -41,46 +41,44 @@ import uvicorn
 setup_application_logging()
 logger = get_logger(__name__)
 
-# Global variables
-redis_client: Optional[redis.Redis] = None
-db_manager: Optional[DatabaseManager] = None
+# 🚀 PHASE 2: Dependency Injection - Use DI container instead of globals
+from dependency_injection import container, ServiceManager
+
+# Initialize service manager
+service_manager = ServiceManager()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager cho FastAPI app"""
-    global redis_client, db_manager
+    """Lifecycle manager cho FastAPI app with Dependency Injection"""
     
     # Startup
-    logger.info("🚀 Starting FastAPI WebSocket server...")
+    logger.info("🚀 Starting FastAPI WebSocket server with DI...")
     
-    # Initialize Redis connection from settings
     try:
+        # Initialize Redis connection from settings
         redis_url = f"redis://{settings.redis.host}:{settings.redis.port}"
         logger.info(f"Connecting to Redis at {redis_url}")
-        redis_client = redis.from_url(redis_url, decode_responses=True)
-        await redis_client.ping()
-        logger.info("✅ Redis connection established")
+        redis_instance = redis.from_url(redis_url, decode_responses=True)
+        await redis_instance.ping()
+        
+        # Register Redis in DI container
+        container.register_singleton('redis_client', redis_instance)
+        logger.info("✅ Redis registered in DI container")
+        
+        # Start application with DI (this initializes all services including DatabaseManager)
+        services = await service_manager.start_application()
+        logger.info("✅ All services initialized via DI")
+        
     except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
-        redis_client = None
-    
-    # Initialize Database Manager
-    try:
-        db_manager = DatabaseManager()
-        logger.info("✅ Database Manager initialized")
-    except Exception as e:
-        logger.error(f"❌ Database Manager initialization failed: {e}")
-        db_manager = None
+        logger.error(f"❌ Service initialization failed: {e}")
+        raise
     
     yield
     
     # Shutdown
     logger.info("🛑 Shutting down FastAPI server...")
-    if redis_client:
-        await redis_client.close()
-    if db_manager:
-        db_manager.close()
+    await service_manager.shutdown_application()
 
 
 # Initialize FastAPI app với lifespan
@@ -203,22 +201,112 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# Dependency để get database manager
+# Dependency functions using DI container
 def get_db() -> DatabaseManager:
-    """Dependency injection cho database manager"""
-    if db_manager is None:
+    """Get database manager from DI container"""
+    try:
+        return container.get('database_manager')
+    except Exception as e:
+        logger.error(f"Failed to get database_manager from DI: {e}")
         raise HTTPException(status_code=503, detail="Database not available")
-    return db_manager
 
 
 def get_redis() -> redis.Redis:
-    """Dependency injection cho Redis client"""
-    if redis_client is None:
+    """Get Redis client from DI container"""
+    try:
+        return container.get('redis_client')
+    except Exception as e:
+        logger.error(f"Failed to get redis_client from DI: {e}")
         raise HTTPException(status_code=503, detail="Redis not available")
-    return redis_client
 
 
 # WebSocket endpoints
+
+@app.websocket("/ws/post/{post_signature}")
+async def websocket_post_monitor(websocket: WebSocket, post_signature: str):
+    """
+    WebSocket endpoint for REAL-TIME post monitoring
+    Perfect for TradingView Lightweight Charts with series.update()
+    
+    Polls database every 5 seconds and sends ONLY new data points
+    """
+    await websocket.accept()
+    logger.info(f"📊 Real-time monitor connected for post: {post_signature[:20]}...")
+    
+    try:
+        db = get_db()
+        
+        # Send initial data
+        post_info = db.get_post_by_signature(post_signature)
+        interactions = db.get_interaction_history(post_signature, limit=100)
+        
+        initial_message = {
+            "type": "initial_data",
+            "post_signature": post_signature,
+            "post_info": post_info,
+            "interactions": interactions,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        await websocket.send_text(json.dumps(initial_message))
+        
+        # Track last known interaction
+        last_interaction_timestamp = None
+        if interactions:
+            last_interaction_timestamp = interactions[0].get('log_timestamp_utc')
+        
+        # Real-time polling loop
+        while True:
+            await asyncio.sleep(5)  # Poll every 5 seconds
+            
+            # Get latest interaction
+            latest_interactions = db.get_interaction_history(post_signature, limit=1)
+            
+            if latest_interactions:
+                latest = latest_interactions[0]
+                current_timestamp = latest.get('log_timestamp_utc')
+                
+                # Check if this is NEW data
+                if current_timestamp != last_interaction_timestamp:
+                    # Parse timestamp for TradingView
+                    try:
+                        timestamp_str = current_timestamp
+                        if 'Z' in timestamp_str:
+                            timestamp_str = timestamp_str.replace('Z', '')
+                        if '+' in timestamp_str:
+                            timestamp_str = timestamp_str.split('+')[0]
+                        dt = datetime.fromisoformat(timestamp_str)
+                        unix_timestamp = int(dt.timestamp())
+                    except Exception as e:
+                        logger.warning(f"Timestamp parse error: {e}")
+                        unix_timestamp = int(datetime.now(timezone.utc).timestamp())
+                    
+                    # Send ONLY the new data point
+                    update_message = {
+                        "type": "new_data_point",
+                        "post_signature": post_signature,
+                        "time": unix_timestamp,
+                        "likes": latest.get('like_count', 0) or 0,
+                        "comments": latest.get('comment_count', 0) or 0,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    await websocket.send_text(json.dumps(update_message))
+                    logger.info(f"📈 Sent new data point: {latest.get('like_count')} likes, {latest.get('comment_count')} comments")
+                    
+                    # Update last known timestamp
+                    last_interaction_timestamp = current_timestamp
+                
+    except WebSocketDisconnect:
+        logger.info(f"🔌 Real-time monitor disconnected for post: {post_signature[:20]}...")
+    except Exception as e:
+        logger.error(f"❌ WebSocket error for post {post_signature[:20]}: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     """
@@ -244,51 +332,51 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         await manager.subscribe_to_post(websocket, post_signature)
                         
                         # Send current data cho post đó
-                        if db_manager:
-                            try:
-                                post_data = db_manager.get_post_by_signature(post_signature)
-                                interaction_history = db_manager.get_interaction_history(post_signature, limit=50)
-                                
-                                response = {
-                                    "type": "post_data",
-                                    "post_signature": post_signature,
-                                    "post_info": post_data,
-                                    "interactions": interaction_history,
-                                    "timestamp": datetime.now(timezone.utc).isoformat()
-                                }
-                                
-                                await websocket.send_text(json.dumps(response))
-                                
-                            except Exception as e:
-                                logger.error(f"❌ Error getting post data: {e}")
-                
-                elif command == "get_system_stats":
-                    # Client request system statistics
-                    if db_manager:
                         try:
-                            stats = db_manager.get_stats()
-                            
-                            # Add Celery queue stats if Redis available
-                            if redis_client:
-                                try:
-                                    # MIGRATION: Updated to use Celery queue names
-                                    celery_queues = ["scan_high", "scan_normal", "discovery", "maintenance"]
-                                    for queue_name in celery_queues:
-                                        queue_length = await redis_client.llen(queue_name)
-                                        stats[f"{queue_name}_queue_length"] = queue_length
-                                except Exception as e:
-                                    logger.warning(f"⚠️ Could not get queue stats: {e}")
+                            db = get_db()
+                            post_data = db.get_post_by_signature(post_signature)
+                            interaction_history = db.get_interaction_history(post_signature, limit=50)
                             
                             response = {
-                                "type": "system_stats",
-                                "data": stats,
+                                "type": "post_data",
+                                "post_signature": post_signature,
+                                "post_info": post_data,
+                                "interactions": interaction_history,
                                 "timestamp": datetime.now(timezone.utc).isoformat()
                             }
                             
                             await websocket.send_text(json.dumps(response))
                             
                         except Exception as e:
-                            logger.error(f"❌ Error getting system stats: {e}")
+                            logger.error(f"❌ Error getting post data: {e}")
+                
+                elif command == "get_system_stats":
+                    # Client request system statistics
+                    try:
+                        db = get_db()
+                        stats = db.get_stats()
+                        
+                        # Add Celery queue stats if Redis available
+                        try:
+                            redis = get_redis()
+                            # MIGRATION: Updated to use Celery queue names
+                            celery_queues = ["scan_high", "scan_normal", "discovery", "maintenance"]
+                            for queue_name in celery_queues:
+                                queue_length = await redis.llen(queue_name)
+                                stats[f"{queue_name}_queue_length"] = queue_length
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not get queue stats: {e}")
+                        
+                        response = {
+                            "type": "system_stats",
+                            "data": stats,
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                        
+                        await websocket.send_text(json.dumps(response))
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Error getting system stats: {e}")
                 
                 else:
                     logger.warning(f"⚠️ Unknown command: {command}")
@@ -351,6 +439,55 @@ async def get_post_interactions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/posts/{post_signature}/latest")
+async def get_post_latest_interaction(
+    post_signature: str,
+    db: DatabaseManager = Depends(get_db)
+):
+    """
+    Get ONLY the latest interaction data point for a post
+    Perfect for incremental chart updates with series.update()
+    """
+    try:
+        # Get only 1 latest interaction
+        interactions = db.get_interaction_history(post_signature, limit=1)
+        
+        if not interactions:
+            raise HTTPException(status_code=404, detail="No interactions found")
+        
+        latest = interactions[0]
+        
+        # Parse timestamp to Unix timestamp for TradingView
+        try:
+            if isinstance(latest.get('log_timestamp_utc'), str):
+                timestamp_str = latest['log_timestamp_utc']
+                if 'Z' in timestamp_str:
+                    timestamp_str = timestamp_str.replace('Z', '')
+                if '+' in timestamp_str:
+                    timestamp_str = timestamp_str.split('+')[0]
+                dt = datetime.fromisoformat(timestamp_str)
+                unix_timestamp = int(dt.timestamp())
+            else:
+                unix_timestamp = int(datetime.now(timezone.utc).timestamp())
+        except Exception as e:
+            logger.warning(f"Timestamp parse error: {e}")
+            unix_timestamp = int(datetime.now(timezone.utc).timestamp())
+        
+        return {
+            "post_signature": post_signature,
+            "timestamp": unix_timestamp,
+            "like_count": latest.get('like_count', 0) or 0,
+            "comment_count": latest.get('comment_count', 0) or 0,
+            "log_timestamp_utc": latest.get('log_timestamp_utc')
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error getting latest interaction for {post_signature}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/stats")
 async def get_system_stats(
     db: DatabaseManager = Depends(get_db),
@@ -384,12 +521,21 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "services": {
-            "database": db_manager is not None,
-            "redis": redis_client is not None
+            "database": False,
+            "redis": False
         }
     }
     
-    if not db_manager or not redis_client:
+    try:
+        get_db()
+        health["services"]["database"] = True
+    except:
+        health["status"] = "degraded"
+    
+    try:
+        get_redis()
+        health["services"]["redis"] = True
+    except:
         health["status"] = "degraded"
     
     return health
@@ -397,7 +543,7 @@ async def health_check():
 
 @app.get("/health")
 async def simple_health_check():
-    """Simple health check endpoint for Docker/load balancers"""
+    """Simple health check endpoint for monitoring and load balancers"""
     return {"status": "ok"}
 
 
@@ -406,14 +552,16 @@ async def redis_listener():
     """
     Background task lắng nghe Redis Pub/Sub cho real-time updates
     """
-    if not redis_client:
+    try:
+        redis = get_redis()
+    except Exception:
         logger.warning("⚠️ Redis not available, skipping Redis listener")
         return
     
     logger.info("👂 Starting Redis Pub/Sub listener...")
     
     try:
-        pubsub = redis_client.pubsub()
+        pubsub = redis.pubsub()
         await pubsub.subscribe("post_updates", "system_stats")
         
         async for message in pubsub.listen():
@@ -446,9 +594,12 @@ async def redis_listener():
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks"""
-    if redis_client:
+    try:
+        get_redis()
         # Start Redis listener trong background
         asyncio.create_task(redis_listener())
+    except Exception:
+        logger.warning("⚠️ Redis not available, skipping Redis listener startup")
 
 
 # Development server

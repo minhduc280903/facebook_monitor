@@ -2,10 +2,12 @@
 """
 Facebook Timestamp Parser - Simplified Strategy Pattern
 Xử lý các định dạng timestamp khác nhau từ Facebook
+
+✅ NEW: GMT+7 timezone conversion utilities
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from logging_config import get_logger
 
@@ -247,3 +249,123 @@ def parse_facebook_timestamp(time_string: str) -> Optional[datetime]:
         datetime object hoặc None
     """
     return _parser_instance.parse(time_string)
+
+
+# ============================================================================
+# ✅ GMT+7 TIMEZONE CONVERSION UTILITIES
+# ============================================================================
+
+def convert_utc_to_gmt7(utc_time: datetime) -> datetime:
+    """
+    Convert UTC datetime to GMT+7 (Asia/Bangkok timezone).
+    
+    ✅ SAFE: Pure utility function, no side effects
+    
+    Args:
+        utc_time: Datetime in UTC (naive or aware)
+        
+    Returns:
+        Datetime in GMT+7 timezone
+        
+    Examples:
+        >>> utc_time = datetime(2025, 10, 4, 10, 30, 0, tzinfo=timezone.utc)
+        >>> gmt7_time = convert_utc_to_gmt7(utc_time)
+        >>> print(gmt7_time)  # 2025-10-04 17:30:00+07:00
+    """
+    try:
+        # Try pytz first (more reliable)
+        from pytz import timezone as pytz_timezone
+        gmt7_tz = pytz_timezone('Asia/Bangkok')
+        
+        # If naive datetime, assume UTC
+        if utc_time.tzinfo is None:
+            utc_time = utc_time.replace(tzinfo=timezone.utc)
+        
+        # Convert to GMT+7
+        return utc_time.astimezone(gmt7_tz)
+        
+    except ImportError:
+        # Fallback: manual offset (+7 hours)
+        logger.debug("⚠️ pytz not available, using manual GMT+7 offset")
+        
+        # If naive datetime, assume UTC
+        if utc_time.tzinfo is None:
+            utc_time = utc_time.replace(tzinfo=timezone.utc)
+        
+        # Add 7 hours for GMT+7
+        from datetime import timedelta, timezone as dt_timezone
+        gmt7_offset = dt_timezone(timedelta(hours=7))
+        return utc_time.astimezone(gmt7_offset)
+
+
+def format_timestamp_gmt7(utc_time: datetime, format_string: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """
+    Format UTC timestamp as GMT+7 string.
+    
+    ✅ SAFE: Pure utility function for display
+    
+    Args:
+        utc_time: Datetime in UTC
+        format_string: strftime format string
+        
+    Returns:
+        Formatted string in GMT+7
+        
+    Examples:
+        >>> utc_time = datetime(2025, 10, 4, 10, 30, 0, tzinfo=timezone.utc)
+        >>> formatted = format_timestamp_gmt7(utc_time)
+        >>> print(formatted)  # "2025-10-04 17:30:00"
+    """
+    if not utc_time:
+        return "N/A"
+    
+    try:
+        gmt7_time = convert_utc_to_gmt7(utc_time)
+        return gmt7_time.strftime(format_string)
+    except Exception as e:
+        logger.warning(f"⚠️ Error formatting timestamp: {e}")
+        return str(utc_time)
+
+
+def parse_iso_to_gmt7(iso_string: str) -> Optional[datetime]:
+    """
+    Parse ISO timestamp string and convert to GMT+7.
+    
+    ✅ SAFE: Combines parsing + conversion
+    
+    Args:
+        iso_string: ISO format timestamp string (e.g., "2025-10-04T10:30:00Z")
+        
+    Returns:
+        Datetime in GMT+7 or None if parsing fails
+        
+    Examples:
+        >>> iso_str = "2025-10-04T10:30:00Z"
+        >>> gmt7_time = parse_iso_to_gmt7(iso_str)
+        >>> print(gmt7_time)  # 2025-10-04 17:30:00+07:00
+    """
+    if not iso_string:
+        return None
+    
+    try:
+        # Parse ISO string (handles 'Z' and '+00:00' suffixes)
+        utc_time = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+        
+        # Convert to GMT+7
+        return convert_utc_to_gmt7(utc_time)
+        
+    except (ValueError, TypeError) as e:
+        logger.warning(f"⚠️ Error parsing ISO timestamp '{iso_string}': {e}")
+        return None
+
+
+def get_current_time_gmt7() -> datetime:
+    """
+    Get current time in GMT+7.
+    
+    ✅ SAFE: Simple utility
+    
+    Returns:
+        Current datetime in GMT+7
+    """
+    return convert_utc_to_gmt7(datetime.now(timezone.utc))

@@ -81,21 +81,34 @@ class DatabaseReader:
 
     def _load_targets_mapping(self) -> None:
         """Load targets mapping từ targets.json để hiển thị tên nhóm."""
+        self.targets_mapping = {}
+        
+        # ✅ FIX: Tìm targets.json ở nhiều locations
+        possible_paths = [
+            "targets.json",  # Current dir
+            os.path.join(parent_dir, "targets.json"),  # Parent dir
+            "/app/targets.json",  # Absolute path for VPS deployment
+        ]
+        
+        targets_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                targets_path = path
+                break
+        
+        if not targets_path:
+            logger.warning("⚠️ targets.json not found - friendly names won't be available")
+            return
+        
         try:
-            targets_path = os.path.join(parent_dir, "targets.json")
-            if os.path.exists(targets_path):
-                with open(targets_path, 'r', encoding='utf-8') as f:
-                    targets_data = json.load(f)
-                    self.targets_mapping = {}
-                    for target in targets_data.get('targets', []):
-                        url = target.get('url', '')
-                        name = target.get('name', target.get('id', ''))
-                        if url:
-                            self.targets_mapping[url] = name
-                logger.info(f"📋 Loaded {len(self.targets_mapping)} targets")
-            else:
-                self.targets_mapping = {}
-                logger.warning("⚠️ targets.json not found")
+            with open(targets_path, 'r', encoding='utf-8') as f:
+                targets_data = json.load(f)
+                for target in targets_data.get('targets', []):
+                    url = target.get('url', '')
+                    name = target.get('name', target.get('id', ''))
+                    if url:
+                        self.targets_mapping[url] = name
+            logger.info(f"📋 Loaded {len(self.targets_mapping)} targets from {targets_path}")
         except Exception as e:
             logger.error(f"❌ Failed to load targets mapping: {e}")
             self.targets_mapping = {}

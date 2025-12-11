@@ -31,28 +31,29 @@ class ScraperCoordinator:
     Implements the Hybrid Logic: fast stream + one-time stream
     """
     
-    def __init__(self, db_manager: DatabaseManager, page: Page):
+    def __init__(self, db_manager: DatabaseManager, page: Page, session_name: str = None):
         """
         Initialize ScraperCoordinator with all components
         
         Args:
             db_manager: Database manager instance
             page: Playwright page instance
+            session_name: Optional session name for per-session behavior variation
         """
         self.db_manager = db_manager
         self.page = page
+        self.session_name = session_name
         self.tracking_duration_days = 7
         
         # Load scraping configuration
         try:
             from config import settings
             self.config = settings.scraping
-            logger.info(f"📋 Loaded scraping config: unlimited_mode={self.config.unlimited_mode}")
+            logger.info(f"📋 Loaded scraping config: max_scroll_hours={self.config.max_scroll_hours}h")
         except Exception as e:
             logger.warning(f"⚠️ Could not load scraping config: {e}, using defaults")
             # Fallback defaults
             class DefaultConfig:
-                unlimited_mode = True
                 max_posts_safety_limit = 999999
                 max_scroll_hours = 24
             self.config = DefaultConfig()
@@ -64,14 +65,14 @@ class ScraperCoordinator:
         self.browser_controller = BrowserController(page, self.selectors)
         self.content_extractor = ContentExtractor(page, self.selectors)
         self.navigation_handler = NavigationHandler(page, self.selectors)
-        self.interaction_simulator = InteractionSimulator(page)
+        # ✅ Pass session_name for per-session behavior variation
+        self.interaction_simulator = InteractionSimulator(page, session_id=session_name)
         
         # Humanization settings
         self.humanization_enabled = True
         
-        logger.info("🎯 ScraperCoordinator initialized with all components")
-        if self.config.unlimited_mode:
-            logger.info("🚀 Unlimited mode enabled - will scrape all posts from start_date")
+        logger.info(f"🎯 ScraperCoordinator initialized with all components (session={session_name})")
+        logger.info("🚀 Date-based scraping enabled - will scrape until reaching start_date (deploy date)")
     
     def _parse_facebook_timestamp(self, time_string: str) -> Optional[datetime]:
         """
@@ -351,10 +352,33 @@ class ScraperCoordinator:
             
             logger.info(f"📦 Processing batch: {len(new_posts_in_batch)} new posts")
             
-            # Extract each post in this batch
-            for i, post_element in enumerate(new_posts_in_batch):
+            # 🚀 OPTIMIZATION: Batch collect signatures first to avoid N+1 queries
+            batch_data = []
+            for post_element in new_posts_in_batch:
+                try:
+                    # Generate signature for this post
+                    post_signature = await self.content_extractor.generate_post_signature(post_element)
+                    if post_signature:
+                        batch_data.append({
+                            'element': post_element,
+                            'signature': post_signature
+                        })
+                except Exception as e:
+                    logger.debug(f"Skip post - cannot generate signature: {e}")
+                    continue
+            
+            # 🚀 BATCH CHECK: Single query instead of N queries
+            all_signatures = [item['signature'] for item in batch_data]
+            existing_signatures = self.db_manager.get_existing_post_signatures_batch(all_signatures)
+            logger.debug(f"⚡ Batch check: {len(existing_signatures)}/{len(all_signatures)} posts exist")
+            
+            # Process each post with pre-fetched existence info
+            for i, item in enumerate(batch_data):
                 try:
                     processed_count += 1
+                    post_element = item['element']
+                    post_signature = item['signature']
+                    is_new_post = post_signature not in existing_signatures
                     
                     # TIME-BASED FILTERING
                     try:
@@ -371,41 +395,57 @@ class ScraperCoordinator:
                     except Exception as e:
                         logger.debug(f"Error checking post time: {e}")
                     
-                    # FAST STREAM - Extract interactions
-                    interaction_result = await self._process_fast_stream(post_element, url)
+                    # ✅ ANTI-DETECTION: Random mouse movement while viewing post (40% chance)
+                    if random.random() < 0.4:
+                        await self.interaction_simulator.random_mouse_movement()
+                    
+                    # FAST STREAM - Extract interactions (without DB check, we already know)
+                    interaction_result = await self._process_fast_stream_optimized(
+                        post_element, url, post_signature, is_new_post
+                    )
                     
                     if interaction_result["success"]:
                         results["interactions_logged"] += 1
                         
                         # Atomic dual-stream for new posts
-                        if interaction_result["is_new_post"]:
+                        if is_new_post:
                             logger.info(f"✨ New post detected ({processed_count}/{total_posts_found})")
                             
                             await self.navigation_handler.expand_post_content(post_element, self.content_extractor)
+                            
+                            # ✅ ANTI-DETECTION: Simulate reading new post (20% chance)
+                            if random.random() < 0.2:
+                                await self.interaction_simulator.random_interaction_during_delay()
+                            
                             post_details = await self._extract_post_details(post_element)
                             
                             if post_details:
                                 atomic_success = self.db_manager.add_new_post_with_interaction(
-                                    post_signature=interaction_result['post_signature'],
+                                    post_signature=post_signature,
                                     post_url=post_details.get('post_url', ''),
                                     source_url=url,
                                     like_count=interaction_result['like_count'],
                                     comment_count=interaction_result['comment_count'],
                                     author_name=post_details.get('author_name', ''),
                                     author_id=post_details.get('author_id', ''),
-                                    post_content=post_details.get('post_content', '')
+                                    post_content=post_details.get('post_content', ''),
+                                    post_type=post_details.get('post_type', 'TEXT'),
+                                    post_status=post_details.get('post_status', 'ACTIVE')
                                 )
                                 
                                 if atomic_success:
                                     results["new_posts"] += 1
                                     results["interactions_logged"] -= 1
-                                    logger.info(f"🎯 Saved post {processed_count}: {interaction_result['post_signature'][:30]}...")
+                                    logger.info(f"🎯 Saved post {processed_count}: {post_signature[:30]}...")
                     else:
                         results["errors"] += 1
                     
-                    # Small delay between posts
-                    if i < len(new_posts_in_batch) - 1:  # Not last post
-                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                    # ✅ ANTI-DETECTION: Human-like delay with interactions (Pareto distribution + mouse movements)
+                    if i < len(batch_data) - 1:  # Not last post
+                        await self.interaction_simulator.humanized_delay_between_posts(
+                            current_index=i,
+                            total_posts=len(batch_data)
+                        )
                         
                 except Exception as e:
                     logger.error(f"❌ Error processing post {processed_count}: {e}")
@@ -415,6 +455,31 @@ class ScraperCoordinator:
             if should_stop:
                 logger.info("🛑 Stopping due to date limit reached")
                 break
+            
+            # 💤 IDLE PERIOD: Random chance to simulate user distraction/multitasking
+            # Real users don't continuously scroll - they get distracted, check other tabs, etc.
+            # 10-15% chance per batch (adjusted by session variation)
+            idle_chance = 0.10 + (random.random() * 0.05)  # 10-15% base chance
+            if random.random() < idle_chance:
+                # Pareto distribution for idle duration
+                # Most idles: 30-60s (quick distraction)
+                # Some idles: 60-120s (longer break)
+                idle_duration = min(random.paretovariate(1.5) * 30, 120.0)
+                logger.info(f"💤 IDLE: Simulating user distraction for {idle_duration:.1f}s...")
+                
+                # During idle, minimal or no activity
+                # 30% chance to have minimal mouse movement during idle
+                if random.random() < 0.3:
+                    await asyncio.sleep(idle_duration * 0.7)
+                    await self.interaction_simulator.random_mouse_movement()
+                    await asyncio.sleep(idle_duration * 0.3)
+                    logger.debug("💤 IDLE: Minor activity during idle")
+                else:
+                    # Complete idle - no activity
+                    await asyncio.sleep(idle_duration)
+                    logger.debug("💤 IDLE: Complete idle period")
+                
+                logger.info(f"✅ IDLE: Resumed after {idle_duration:.1f}s break")
             
             # 📜 SCROLL FOR MORE POSTS
             last_count = total_posts_found
@@ -508,19 +573,61 @@ class ScraperCoordinator:
         logger.info(f"✅ Finished scrolling. Found {len(post_elements)} posts in {elapsed_total:.1f}s ({total_scrolls} scrolls)")
         return post_elements
 
+    def _clean_facebook_url(self, url: str) -> str:
+        """
+ư        Clean Facebook URL by removing ALL query parameters
+        
+        Examples:
+        IN:  https://www.facebook.com/groups/OFFB.VN/posts/25156158847358662/?__cft__[0]=...&__tn__=...
+        OUT: https://www.facebook.com/groups/OFFB.VN/posts/25156158847358662/
+        
+        IN:  https://www.facebook.com/groups/OFFB.VN/posts/25152263871081493/?comment_id=25152481784393035
+        OUT: https://www.facebook.com/groups/OFFB.VN/posts/25152263871081493/
+        
+        ✅ Removes: comment_id, __cft__, __tn__, and ALL other parameters
+        """
+        try:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(url)
+            # Remove ALL query parameters (?, &, comment_id, __cft__, __tn__, etc.)
+            clean_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+            logger.debug(f"🧹 Cleaned URL: {url[:80]} -> {clean_url[:80]}")
+            return clean_url
+        except Exception as e:
+            logger.warning(f"⚠️ Could not clean URL: {e}, using original")
+            return url
+    
     async def _extract_post_details(self, post_element) -> Optional[Dict[str, Any]]:
         """
         Extract detailed data from post element (Phase 3.0)
         
         Returns:
             Dict containing: post_url, author_name, author_id, post_content
+            None if post_url cannot be extracted (prevents saving invalid posts)
+        
+        ✅ FIX: Validate post_url exists before proceeding to prevent empty URLs in database
         """
         try:
             details = {}
             
             # ===== EXTRACT POST URL using resilient extraction =====
             post_url = await self.content_extractor.extract_data(post_element, 'post_url')
-            details['post_url'] = post_url if post_url else ''
+            
+            # ✅ CRITICAL VALIDATION: Post MUST have valid URL
+            if not post_url or not post_url.strip():
+                logger.warning("⚠️ Skipping post - No post_url extracted (cannot rescan without URL)")
+                return None  # Skip this post - don't save to database
+            
+            # ✅ Validate URL format
+            post_url = post_url.strip()
+            if not (post_url.startswith('http://') or post_url.startswith('https://')):
+                logger.warning(f"⚠️ Skipping post - Invalid URL format: {post_url[:50]}")
+                return None  # Skip this post
+            
+            # ✅ Clean URL: Remove tracking parameters (__cft__, __tn__, etc.)
+            post_url = self._clean_facebook_url(post_url)
+            
+            details['post_url'] = post_url
             
             # ===== EXTRACT AUTHOR INFO using resilient extraction =====
             author_name = await self.content_extractor.extract_data(post_element, 'author_name')
@@ -533,7 +640,34 @@ class ScraperCoordinator:
             content = await self.content_extractor.extract_data(post_element, 'post_content')
             details['post_content'] = content if content else ''
             
-            logger.debug(f"📝 Resilient extracted details: author={details['author_name']}, content_length={len(details['post_content'])}")
+            # ===== ✅ NEW: DETECT POST TYPE (VIDEO/PHOTO/TEXT/LINK) =====
+            try:
+                post_type = await self.content_extractor.detect_post_type(post_element)
+                details['post_type'] = post_type
+                logger.debug(f"🎯 Detected post_type: {post_type}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error detecting post_type: {e}")
+                details['post_type'] = 'TEXT'  # Safe fallback
+            
+            # ===== ✅ NEW: DETECT POST STATUS (ACTIVE/DEAD/STALE) =====
+            try:
+                # Calculate post age from timestamp if available
+                post_age_hours = None
+                timestamp_element = await self.content_extractor.extract_data(post_element, 'post_timestamp')
+                if timestamp_element:
+                    parsed_time = parse_facebook_timestamp(timestamp_element)
+                    if parsed_time:
+                        age_delta = datetime.now() - parsed_time
+                        post_age_hours = age_delta.total_seconds() / 3600
+                
+                post_status = await self.content_extractor.detect_post_status(post_element, post_age_hours)
+                details['post_status'] = post_status
+                logger.debug(f"🎯 Detected post_status: {post_status} (age: {post_age_hours:.1f}h)" if post_age_hours else f"🎯 Detected post_status: {post_status}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error detecting post_status: {e}")
+                details['post_status'] = 'ACTIVE'  # Safe fallback
+            
+            logger.debug(f"📝 Resilient extracted details: author={details['author_name']}, content_length={len(details['post_content'])}, type={details.get('post_type')}, status={details.get('post_status')}")
             
             return details
             
@@ -544,6 +678,9 @@ class ScraperCoordinator:
     async def _process_fast_stream(self, post_element, source_url: str) -> Dict[str, Any]:
         """
         FAST STREAM - Always run to get signature and interactions
+        
+        ⚠️ DEPRECATED: Use _process_fast_stream_optimized for batch processing
+        This method is kept for backward compatibility
         
         Returns:
             Dict with keys: success, post_signature, is_new_post, like_count, comment_count
@@ -580,6 +717,54 @@ class ScraperCoordinator:
                 "success": success,
                 "post_signature": post_signature,
                 "is_new_post": is_new_post,
+                "like_count": like_count,
+                "comment_count": comment_count
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error in fast stream processing: {type(e).__name__}: {e}", exc_info=False)
+            return {"success": False, "error": f"{type(e).__name__}: {str(e)}"}
+    
+    async def _process_fast_stream_optimized(self, post_element, source_url: str, 
+                                            post_signature: str, is_new_post: bool) -> Dict[str, Any]:
+        """
+        🚀 OPTIMIZED FAST STREAM - No DB check needed, signature & existence pre-fetched
+        
+        This method is used in batch processing where we already know:
+        - post_signature (from batch signature generation)
+        - is_new_post (from batch existence check)
+        
+        Args:
+            post_element: Playwright element handle
+            source_url: Source URL being scraped
+            post_signature: Pre-generated post signature
+            is_new_post: Whether post is new (from batch check)
+        
+        Returns:
+            Dict with keys: success, like_count, comment_count
+        """
+        try:
+            # 1. Get interaction counts using resilient extraction
+            like_count = await self.content_extractor.extract_data(post_element, 'like_count')
+            comment_count = await self.content_extractor.extract_data(post_element, 'comment_count')
+            
+            # Fallback to 0 if extraction failed but ensure integers
+            like_count = like_count if isinstance(like_count, int) else 0
+            comment_count = comment_count if isinstance(comment_count, int) else 0
+            
+            # 2. Log interaction to database
+            current_utc = datetime.now(timezone.utc).isoformat()
+            success = self.db_manager.log_interaction(
+                post_signature=post_signature,
+                log_timestamp_utc=current_utc,
+                like_count=like_count,
+                comment_count=comment_count
+            )
+            
+            logger.debug(f"⚡ Fast stream (optimized): {like_count} likes, {comment_count} comments, new={is_new_post}")
+            
+            return {
+                "success": success,
                 "like_count": like_count,
                 "comment_count": comment_count
             }

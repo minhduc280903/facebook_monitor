@@ -169,13 +169,9 @@ class ServiceManager:
         from config import settings
         self.container.register_singleton('config', settings)
         
-        # Database Manager
+        # Database Manager (gets config from settings internally)
         from core.database_manager import DatabaseManager
-        self.container.register_service(
-            'database_manager',
-            DatabaseManager,
-            db_config='@config.database'
-        )
+        self.container.register_singleton('database_manager', DatabaseManager())
         
         # Session Manager  
         from core.session_manager import SessionManager
@@ -186,13 +182,12 @@ class ServiceManager:
             sessions_dir='sessions'
         )
         
-        # Proxy Manager
+        # Proxy Manager - NOW WITH DATABASE!
         from core.proxy_manager import ProxyManager
-        self.container.register_service(
+        db_manager = self.container.get('database_manager')
+        self.container.register_factory(
             'proxy_manager',
-            ProxyManager,
-            proxy_file='proxies.txt',
-            status_file='proxy_status.json'
+            lambda: ProxyManager(db_manager=db_manager)  # Inject db_manager
         )
         
         # Circuit Breaker

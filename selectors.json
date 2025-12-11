@@ -1,9 +1,9 @@
 {
   "meta": {
-    "version": "5.0-production-optimized",
-    "description": "Facebook Selectors - CLEANED - Only working strategies verified Oct 1 2025",
-    "last_updated": "2025-10-01",
-    "note": "All fallback strategies removed. Only confirmed working selectors."
+    "version": "6.0-post-type-detection",
+    "description": "Facebook Selectors - WITH POST TYPE DETECTION - Oct 4 2025",
+    "last_updated": "2025-10-04",
+    "note": "Added post_type_video, post_type_photo, post_type_link detection. Removed author_name (not needed)."
   },
   "post_containers": {
     "strategies": [
@@ -49,32 +49,35 @@
     }
   },
   "comment_count": {
+    "NOTE_CRITICAL": "Facebook A/B testing - comment counts NOT displayed for many users/regions. VPS shows only 'Comment' button, no count. Local browser may show '6 bình luận' but VPS does not. This is NOT a selector issue - the HTML element does NOT exist!",
     "strategies": [
       {
         "type": "xpath",
-        "path": ".//span[contains(text(), 'bình luận')]",
+        "path": ".//span[contains(text(), ' bình luận') and string-length(normalize-space(text())) > 5 and string-length(normalize-space(text())) < 30 and not(contains(text(), 'Xem')) and not(contains(text(), 'Viết')) and not(contains(text(), 'thêm'))]",
         "priority": 1,
-        "description": "✅ WORKING: Vietnamese '13 bình luận'"
+        "description": "✅ STRICT: Vietnamese 'X bình luận' (with space before)"
       },
       {
         "type": "xpath",
-        "path": ".//span[contains(text(), 'comment')]",
+        "path": ".//span[contains(translate(text(), 'COMMENTS', 'comments'), ' comment') and string-length(normalize-space(text())) > 5 and string-length(normalize-space(text())) < 30 and not(contains(translate(text(), 'VIEW', 'view'), 'view')) and not(contains(translate(text(), 'WRITE', 'write'), 'write'))]",
         "priority": 2,
-        "description": "✅ WORKING: English '11 comments'"
+        "description": "✅ STRICT: English 'X comments' (with space before)"
       },
       {
         "type": "xpath",
-        "path": ".//div[@role='button']//span[contains(text(), 'bình luận')]",
+        "path": ".//span[starts-with(normalize-space(text()), '0') or starts-with(normalize-space(text()), '1') or starts-with(normalize-space(text()), '2') or starts-with(normalize-space(text()), '3') or starts-with(normalize-space(text()), '4') or starts-with(normalize-space(text()), '5') or starts-with(normalize-space(text()), '6') or starts-with(normalize-space(text()), '7') or starts-with(normalize-space(text()), '8') or starts-with(normalize-space(text()), '9')][contains(text(), ' bình luận')]",
         "priority": 3,
-        "description": "✅ Vietnamese comment button (0 comments)"
+        "description": "✅ STRICT: Starts with digit + ' bình luận' (with space)"
       },
       {
         "type": "xpath",
-        "path": ".//div[@role='button']//span[contains(text(), 'Comment')]",
+        "path": ".//span[starts-with(normalize-space(text()), '0') or starts-with(normalize-space(text()), '1') or starts-with(normalize-space(text()), '2') or starts-with(normalize-space(text()), '3') or starts-with(normalize-space(text()), '4') or starts-with(normalize-space(text()), '5') or starts-with(normalize-space(text()), '6') or starts-with(normalize-space(text()), '7') or starts-with(normalize-space(text()), '8') or starts-with(normalize-space(text()), '9')][contains(translate(text(), 'COMMENTS', 'comments'), ' comment')]",
         "priority": 4,
-        "description": "✅ English comment button (0 comments)"
+        "description": "✅ STRICT: Starts with digit + ' comment' (with space)"
       }
     ],
+    "fallback_value": 0,
+    "note": "Facebook changed HTML Nov 2024 - comment counts NO LONGER displayed. Will return 0 if not found.",
     "validation": {
       "type": "integer",
       "required": true,
@@ -114,43 +117,90 @@
     "strategies": [
       {
         "type": "xpath",
-        "path": "//span[string-length(normalize-space(text())) > 20 and not(contains(text(), 'Like')) and not(contains(text(), 'Comment'))]",
+        "path": ".//div[@dir='auto']//span[string-length(normalize-space(text())) > 30]",
         "priority": 1,
-        "description": "✅ WORKING: Content spans"
+        "description": "✅ Content in div[dir=auto] with min 30 chars"
+      },
+      {
+        "type": "xpath",
+        "path": ".//span[string-length(normalize-space(text())) > 30 and not(contains(text(), 'Xem tất cả')) and not(contains(text(), 'phản hồi')) and not(contains(text(), 'View all')) and not(contains(text(), 'replies')) and not(contains(text(), 'Photos from')) and not(contains(text(), 'Người tham gia')) and not(contains(text(), 'ẩn danh')) and not(contains(text(), 'Like')) and not(contains(text(), 'Comment')) and not(contains(text(), 'Share'))]",
+        "priority": 2,
+        "description": "✅ STRICT: Exclude buttons, metadata, min 30 chars"
+      },
+      {
+        "type": "xpath",
+        "path": ".//div[contains(@data-ad-comet-preview, 'message')]//span",
+        "priority": 3,
+        "description": "✅ Post message container (data-ad-comet-preview)"
       }
     ],
     "validation": {
       "type": "text_not_empty",
       "required": false,
-      "min_length": 1
+      "min_length": 10
     }
   },
-  "author_name": {
+  "post_type_video": {
     "strategies": [
       {
         "type": "css",
-        "path": "strong",
+        "path": "video",
         "priority": 1,
-        "description": "✅ WORKING: Strong text"
+        "description": "✅ Video element in post"
       },
       {
-        "type": "css",
-        "path": "h3",
+        "type": "xpath",
+        "path": ".//a[contains(@href, '/videos/') or contains(@href, '/reel/')]",
         "priority": 2,
-        "description": "✅ WORKING: H3 heading"
-      },
-      {
-        "type": "css",
-        "path": "h1, h2, h3, h4, h5, h6",
-        "priority": 3,
-        "description": "✅ WORKING: Any heading"
+        "description": "✅ Video/Reel URL patterns"
       }
     ],
     "validation": {
-      "type": "text_not_empty",
+      "type": "elements_found",
       "required": false,
-      "min_length": 1,
-      "max_length": 200
+      "min_count": 0
+    }
+  },
+  "post_type_photo": {
+    "strategies": [
+      {
+        "type": "css",
+        "path": "img[src*='scontent']",
+        "priority": 1,
+        "description": "✅ Content images (scontent CDN)"
+      },
+      {
+        "type": "xpath",
+        "path": ".//a[contains(@href, '/photo/') or contains(@href, '/photos/')]",
+        "priority": 2,
+        "description": "✅ Photo URL patterns"
+      }
+    ],
+    "validation": {
+      "type": "elements_found",
+      "required": false,
+      "min_count": 0
+    }
+  },
+  "post_type_link": {
+    "strategies": [
+      {
+        "type": "xpath",
+        "path": ".//a[contains(@href, 'l.facebook.com/l.php') or contains(@aria-label, 'External link')]",
+        "priority": 1,
+        "description": "✅ External link redirects"
+      },
+      {
+        "type": "css",
+        "path": "a[rel='nofollow noopener']",
+        "priority": 2,
+        "description": "✅ External links with nofollow"
+      }
+    ],
+    "validation": {
+      "type": "elements_found",
+      "required": false,
+      "min_count": 0
     }
   },
   "post_url": {
@@ -160,6 +210,12 @@
         "path": "a[role='link'][href*='/posts/']",
         "priority": 1,
         "description": "✅ WORKING: Direct post links"
+      },
+      {
+        "type": "xpath",
+        "path": ".//a[contains(@href, '/posts/') or contains(@href, '/permalink/')]",
+        "priority": 2,
+        "description": "✅ Post permalink patterns"
       }
     ],
     "validation": {
@@ -168,34 +224,25 @@
       "must_contain": ["facebook.com"]
     }
   },
-  "author_profile_url": {
+  "post_timestamp": {
     "strategies": [
       {
         "type": "css",
-        "path": "a[href*='/user/']",
+        "path": "abbr",
         "priority": 1,
-        "description": "✅ WORKING: User profile links"
-      }
-    ],
-    "validation": {
-      "type": "url",
-      "required": false,
-      "must_contain": ["facebook.com"]
-    }
-  },
-  "expand_buttons": {
-    "strategies": [
+        "description": "✅ Timestamp in abbr tag"
+      },
       {
-        "type": "css",
-        "path": "div[role='button']:has-text('See more')",
-        "priority": 1,
-        "description": "✅ WORKING: See more buttons"
+        "type": "xpath",
+        "path": ".//a[contains(@href, '?comment_id=') or contains(@href, '&comment_id=')]//span[contains(text(), 'phút') or contains(text(), 'giờ') or contains(text(), 'h') or contains(text(), 'min')]",
+        "priority": 2,
+        "description": "✅ Relative time spans (X phút, X giờ)"
       }
     ],
     "validation": {
-      "type": "elements_found",
+      "type": "text_not_empty",
       "required": false,
-      "min_count": 0
+      "min_length": 1
     }
   }
 }

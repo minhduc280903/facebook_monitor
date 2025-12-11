@@ -4,11 +4,11 @@ Proxy Manager for Facebook Post Monitor - Enterprise Edition Phase 3.1
 Quản lý pool proxy để mỗi worker sử dụng proxy riêng biệt
 
 Mục đích:
-- Quản lý pool các proxy servers đã cấu hình
+- Quản lý pool các proxy servers done: cấu hình
 - Thread-safe checkout/checkin proxies
 - Tránh multiple workers sử dụng cùng proxy (tránh bị phát hiện)
 - Rotation và health checking cho proxies
-- Tái sử dụng pattern từ SessionManager (đã proven và hoàn thiện)
+- Tái sử dụng pattern từ SessionManager (done: proven và hoàn thiện)
 """
 
 import json
@@ -49,18 +49,26 @@ class ProxyManager:
     - TESTING: Proxy đang được health check
     """
     
-    def __init__(self, proxy_file: str = "proxies.txt", status_file: str = "proxy_status.json"):
+    def __init__(self, db_manager = None, proxy_file: str = "proxies.txt", status_file: str = "proxy_status.json"):
         """
-        Khởi tạo ProxyManager với cross-process file locking
+        Initialize ProxyManager với DATABASE-FIRST approach
         
         Args:
-            proxy_file: File chứa danh sách proxy (format: ip:port:user:pass hoặc ip:port)
-            status_file: File JSON theo dõi trạng thái proxies
+            db_manager: DatabaseManager instance (từ DI)
+            proxy_file: Legacy file (deprecated, for migration only)
+            status_file: Legacy file (deprecated, for migration only)
         """
         from config import settings
         
-        self.proxy_file = proxy_file
-        self.status_file = status_file
+        # Database manager (primary storage)
+        if db_manager is None:
+            from core.database_manager import DatabaseManager
+            self.db = DatabaseManager()
+        else:
+            self.db = db_manager
+        
+        self.proxy_file = proxy_file  # Deprecated
+        self.status_file = status_file  # Deprecated
         self.lock = threading.Lock()  # Thread-safe access
         
         # Load performance thresholds from config instead of hard-coded values
@@ -81,46 +89,98 @@ class ProxyManager:
         if FILELOCK_AVAILABLE:
             self.file_lock_path = self.status_file + ".lock"
             self.file_lock = FileLock(self.file_lock_path)
-            logger.info("🔒 Cross-process file locking enabled for proxies")
+            logger.info("[LOCK] Cross-process file locking enabled for proxies")
         else:
             self.file_lock = None
-            logger.warning("⚠️ FileLock not available - only thread-safe within process")
+            logger.warning("[WARN] FileLock not available - only thread-safe within process")
         
-        # Ensure files exist and load resources
-        self._ensure_structure()
-        self._load_resources_to_memory()
+        # Load resources from database
+        self._load_proxies_from_db()
         
-        logger.info(f"🔐 ProxyManager khởi tạo: {proxy_file} -> {status_file}")
+        logger.info(f"[DB] ProxyManager initialized with database backend")
     
-    def _load_resources_to_memory(self):
-        """Load tất cả proxy resources từ file vào memory cache."""
-        status_data = self._read_status_file()
+    def _load_proxies_from_db(self):
+        """
+        Load tất cả proxy resources từ DATABASE vào memory cache
+        
+        REPLACES: _load_proxies_from_file() + _load_proxies_from_db()
+        
+        ✅ FIX: Use stable identifier (host:port) instead of database ID
+        """
+        proxies = self.db.get_all_proxies()
         self.resource_pool.clear()
         
-        for resource_id, resource_data in status_data.items():
-            try:
-                resource = ManagedResource.from_dict(resource_data)
-                # Ensure it's marked as proxy type
-                resource.type = "proxy"
-                self.resource_pool[resource_id] = resource
-            except Exception as e:
-                logger.warning(f"⚠️ Lỗi load proxy resource {resource_id}: {e}")
-                # Fallback to basic resource
-                resource = ManagedResource(resource_id, "proxy")
-                if isinstance(resource_data, dict):
-                    resource.status = resource_data.get("status", "DISABLED")
-                    if "config" in resource_data:
-                        resource.metadata["config"] = resource_data["config"]
-                self.resource_pool[resource_id] = resource
+        for proxy in proxies:
+            # ✅ FIX: Use stable identifier format: host:port
+            resource_id = f"{proxy['host']}:{proxy['port']}"
+            resource = ManagedResource(resource_id, "proxy")
+            
+            # Map DB fields to ManagedResource
+            resource.status = proxy['status']
+            resource.consecutive_failures = proxy['consecutive_failures']
+            resource.total_tasks = proxy['total_tasks']
+            resource.successful_tasks = proxy['successful_tasks']
+            resource.success_rate = proxy['success_rate']
+            resource.quarantine_reason = proxy['quarantine_reason']
+            resource.quarantine_count = proxy['quarantine_count']
+            resource.quarantine_until_timestamp = proxy['quarantine_until']
+            resource.last_used_timestamp = proxy['last_used_at']
+            
+            # Store proxy config in metadata
+            resource.metadata = {
+                'db_id': proxy['id'],  # CRITICAL: Link to DB row
+                'config': {
+                    'type': proxy['proxy_type'],
+                    'host': proxy['host'],
+                    'port': proxy['port'],
+                    'username': proxy['username'],
+                    'password': proxy['password']
+                },
+                'response_time': proxy['response_time'],
+                'last_checked': proxy['last_checked_at'].isoformat() if proxy['last_checked_at'] else None,
+                'geolocation': proxy['geolocation']
+            }
+            
+            self.resource_pool[resource_id] = resource
         
-        logger.info(f"📋 Loaded {len(self.resource_pool)} proxy resources to memory")
+        logger.info(f"[DB] Loaded {len(self.resource_pool)} proxy resources from database (using host:port as ID)")
     
-    def _sync_resources_to_file(self):
-        """Sync in-memory proxy resources back to file."""
-        status_data = {}
+    def _sync_resources_to_db(self):
+        """
+        Sync in-memory proxy resources back to DATABASE
+        
+        REPLACES: _sync_resources_to_db()
+        
+        ⚠️ CALLER MUST HOLD LOCK! This method does NOT acquire locks.
+        """
         for resource_id, resource in self.resource_pool.items():
-            status_data[resource_id] = resource.to_dict()
-        self._write_status_file(status_data)
+            db_id = resource.metadata.get('db_id')
+            if not db_id:
+                logger.warning(f"[DB] Resource {resource_id} has no db_id, skipping sync")
+                continue
+            
+            # Prepare metadata for DB update
+            metadata = {
+                'consecutive_failures': resource.consecutive_failures,
+                'total_tasks': resource.total_tasks,
+                'successful_tasks': resource.successful_tasks,
+                'success_rate': resource.success_rate,
+                'last_checked_at': resource.metadata.get('last_checked'),
+                'response_time': resource.metadata.get('response_time'),
+                'geolocation': resource.metadata.get('geolocation'),
+                'quarantine_reason': resource.quarantine_reason,
+                'quarantine_until': resource.quarantine_until_timestamp,
+                'last_used_at': resource.last_used_timestamp
+            }
+            
+            # Update database
+            self.db.update_proxy_status(
+                proxy_id=db_id,
+                status=resource.status,
+                metadata=metadata
+            )
+        
+        logger.debug(f"[DB] Synced {len(self.resource_pool)} resources to database")
     
     def _process_cooldowns(self) -> int:
         """
@@ -139,7 +199,7 @@ class ProxyManager:
                     resource.quarantine_until_timestamp = None
                     resource.consecutive_failures = 0  # Reset failures after cooldown
                     released_count += 1
-                    logger.info(f"🎆 Proxy {resource.id} released from quarantine")
+                    logger.info(f"[SUCCESS] Proxy {resource.id} released from quarantine")
         
         return released_count
     
@@ -161,6 +221,9 @@ class ProxyManager:
             if resource.status in ["READY", "FAILED"] and len(candidates) < 3:
                 candidates.append(resource)
         
+        if not candidates:
+            return
+        
         for resource in candidates:
             try:
                 resource.status = "TESTING"
@@ -169,14 +232,19 @@ class ProxyManager:
                     is_healthy = self.health_check_proxy({**proxy_config, "proxy_id": resource.id})
                     if is_healthy:
                         resource.status = "READY"
-                        logger.debug(f"✅ Health check passed for proxy {resource.id}")
+                        logger.debug(f"[OK] Health check passed for proxy {resource.id}")
                     else:
                         resource.status = "FAILED"
                         resource.consecutive_failures += 1
-                        logger.warning(f"❌ Health check failed for proxy {resource.id}")
+                        logger.warning(f"[ERROR] Health check failed for proxy {resource.id}")
             except Exception as e:
-                logger.error(f"❌ Health check error for proxy {resource.id}: {e}")
+                logger.error(f"[ERROR] Health check error for proxy {resource.id}: {e}")
                 resource.status = "FAILED"
+        
+        # ✅ Sync results after batch health checks (already in caller's context)
+        # NOTE: This is called from background thread, need lock
+        with self.locks():
+            self._sync_resources_to_db()
     
     def _log_proxy_stats(self):
         """Log current proxy statistics for debugging."""
@@ -196,10 +264,15 @@ class ProxyManager:
             elif resource.status == "TESTING":
                 stats["testing"] += 1
         
-        logger.debug(f"📊 Proxy stats: {stats}")
+        logger.debug(f"[STATS] Proxy stats: {stats}")
     
     def _ensure_structure(self):
-        """Đảm bảo cấu trúc file proxy tồn tại (tương tự SessionManager)"""
+        """
+        ⚠️ DEPRECATED - DATABASE-FIRST APPROACH
+        
+        This method is NO LONGER USED - ProxyManager now loads from DATABASE.
+        Kept for backward compatibility with migration scripts only.
+        """
         
         # Tạo proxy file template nếu chưa có
         if not os.path.exists(self.proxy_file):
@@ -220,8 +293,22 @@ class ProxyManager:
                 f.write(template_content)
             logger.info(f"📄 Tạo template proxy file: {self.proxy_file}")
         
-        # Tạo status file nếu chưa có
+        # [OK] FIX: Tạo status file nếu chưa có HOẶC nếu empty
+        needs_init = False
         if not os.path.exists(self.status_file):
+            needs_init = True
+        else:
+            # Check if file is empty or only contains {}
+            try:
+                with open(self.status_file, 'r') as f:
+                    existing_data = json.load(f)
+                    if not existing_data or len(existing_data) == 0:
+                        needs_init = True
+                        logger.warning(f"[WARN] proxy_status.json is empty, reinitializing from {self.proxy_file}")
+            except:
+                needs_init = True
+        
+        if needs_init:
             # Scan proxy file để tạo initial status
             proxies = self._load_proxies_from_file()
             initial_status = {}
@@ -255,7 +342,14 @@ class ProxyManager:
             logger.info(f"📄 Tạo proxy status file với {len(initial_status)} proxies")
     
     def _load_proxies_from_file(self) -> List[Dict[str, Any]]:
-        """Load danh sách proxy từ file cấu hình"""
+        """
+        ⚠️ DEPRECATED - DATABASE-FIRST APPROACH
+        
+        Load danh sách proxy từ file cấu hình (LEGACY)
+        
+        This method is ONLY used by migration script (migrate_proxies_to_db.py).
+        Normal operation uses _load_proxies_from_db() instead.
+        """
         proxies = []
         
         try:
@@ -273,13 +367,13 @@ class ProxyManager:
                 if proxy_config:
                     proxies.append(proxy_config)
                 else:
-                    logger.warning(f"⚠️ Invalid proxy format at line {line_num}: {line}")
+                    logger.warning(f"[WARN] Invalid proxy format at line {line_num}: {line}")
             
-            logger.info(f"📋 Loaded {len(proxies)} proxies from {self.proxy_file}")
+            logger.info(f"[INFO] Loaded {len(proxies)} proxies from {self.proxy_file}")
             return proxies
             
         except Exception as e:
-            logger.error(f"❌ Lỗi load proxy file: {e}")
+            logger.error(f"[ERROR] Error load proxy file: {e}")
             return []
     
     def _parse_proxy_line(self, line: str) -> Optional[Dict[str, Any]]:
@@ -326,21 +420,113 @@ class ProxyManager:
             return None
     
     def _read_status_file(self) -> Dict[str, Any]:
-        """Đọc proxy status từ file (thread-safe) - tương tự SessionManager"""
+        """
+        Đọc proxy status từ file với ERROR RECOVERY strategy
+        
+        ✅ CRITICAL FIX: Proper error handling với backup restore
+        ✅ CRITICAL FIX: Validation để detect corruption sớm
+        """
+        import shutil
+        
         try:
             with open(self.status_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logger.error(f"❌ Lỗi đọc proxy status: {e}")
+                data = json.load(f)
+                
+                # ✅ FIX #2: Validate data integrity
+                if not isinstance(data, dict):
+                    raise ValueError(f"Invalid status file format: expected dict, got {type(data)}")
+                
+                return data
+                
+        except FileNotFoundError:
+            # ✅ OK: File doesn't exist yet (first run)
+            logger.warning(f"[WARN] Proxy status file not found: {self.status_file} (will be created)")
             return {}
+            
+        except json.JSONDecodeError as e:
+            # ❌ CRITICAL: File is corrupted!
+            logger.error(f"[CRITICAL] Proxy status file corrupted: {e}")
+            
+            # ✅ FIX #2: Try to restore from backup
+            backup_path = self.status_file + ".backup"
+            if os.path.exists(backup_path):
+                try:
+                    logger.info(f"[RECOVERY] Attempting restore from backup: {backup_path}")
+                    
+                    # Validate backup before restore
+                    with open(backup_path, 'r', encoding='utf-8') as f:
+                        backup_data = json.load(f)
+                        if not isinstance(backup_data, dict):
+                            raise ValueError("Backup file also corrupted")
+                    
+                    # Backup is valid, restore it
+                    shutil.copy2(backup_path, self.status_file)
+                    logger.info("[RECOVERY] ✅ Successfully restored proxy status from backup")
+                    
+                    return backup_data
+                    
+                except Exception as backup_error:
+                    logger.error(f"[RECOVERY] ❌ Backup restore failed: {backup_error}")
+            else:
+                logger.error("[RECOVERY] ❌ No backup file available")
+            
+            # ✅ FIX #2: Raise exception instead of silent failure
+            raise RuntimeError(
+                f"Proxy status file corrupted and recovery failed. "
+                f"Manual intervention required: {self.status_file}"
+            )
+            
+        except Exception as e:
+            # Other unexpected errors
+            logger.error(f"[ERROR] Unexpected error reading proxy status file: {e}")
+            raise
     
     def _write_status_file(self, status_data: Dict[str, Any]):
-        """Ghi proxy status vào file (thread-safe) - tương tự SessionManager"""
+        """
+        Ghi proxy status vào file với ATOMIC WRITE + BACKUP strategy
+        
+        ✅ CRITICAL FIX: Atomic write prevents corruption on crash
+        ✅ CRITICAL FIX: Backup enables recovery from corruption
+        """
+        import tempfile
+        import shutil
+        
         try:
-            with open(self.status_file, 'w', encoding='utf-8') as f:
-                json.dump(status_data, f, indent=2, ensure_ascii=False)
+            # ✅ FIX #6: Backup current file trước khi write (nếu exists)
+            backup_path = self.status_file + ".backup"
+            if os.path.exists(self.status_file):
+                try:
+                    shutil.copy2(self.status_file, backup_path)
+                except Exception as e:
+                    logger.warning(f"[WARN] Cannot create proxy backup: {e}")
+            
+            # ✅ FIX #1: ATOMIC WRITE - Write to temp file first
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=os.path.dirname(self.status_file) or '.',
+                prefix='.tmp_proxy_',
+                suffix='.json'
+            )
+            
+            try:
+                # Write to temp file
+                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                    json.dump(status_data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())  # Force write to disk
+                
+                # ✅ ATOMIC: Rename is atomic on all modern OS
+                os.replace(temp_path, self.status_file)
+                
+                logger.debug(f"📝 Atomic write: {len(status_data)} proxies to {self.status_file}")
+                
+            except Exception as e:
+                # Clean up temp file if write failed
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise
+                
         except Exception as e:
-            logger.error(f"❌ Lỗi ghi proxy status: {e}")
+            logger.error(f"[ERROR] Error writing proxy status: {e}")
             raise
     
     @contextmanager
@@ -363,7 +549,7 @@ class ProxyManager:
         """
         Intelligent proxy checkout với performance-based selection
         
-        ⚠️ DEPRECATED: Use SessionManager.checkout_session_with_proxy() for production
+        [WARN] DEPRECATED: Use SessionManager.checkout_session_with_proxy() for production
         This method is maintained for backward compatibility and unit testing
         
         Args:
@@ -393,12 +579,12 @@ class ProxyManager:
                     with self.file_lock:
                         result = self._intelligent_checkout()
                         if result:
-                            self._sync_resources_to_file()
+                            self._sync_resources_to_db()
                             return result
                 else:
                     result = self._intelligent_checkout()
                     if result:
-                        self._sync_resources_to_file()
+                        self._sync_resources_to_db()
                         return result
             
             time.sleep(1)
@@ -426,7 +612,7 @@ class ProxyManager:
                 # Validate proxy config
                 proxy_config = resource.metadata.get("config")
                 if not proxy_config or not self._validate_proxy_config(proxy_config):
-                    logger.warning(f"⚠️ Proxy config invalid: {resource_id}")
+                    logger.warning(f"[WARN] Proxy config invalid: {resource_id}")
                     resource.status = "DISABLED"
                     continue
                     
@@ -447,11 +633,11 @@ class ProxyManager:
             proxy_config = selected.metadata["config"].copy()
             proxy_config["proxy_id"] = selected.id
             
-            logger.info(f"🎯 Intelligently selected proxy: {selected.id} (success_rate: {selected.success_rate:.2f})")
+            logger.info(f"[TARGET] Intelligently selected proxy: {selected.id} (success_rate: {selected.success_rate:.2f})")
             return proxy_config
         
         except Exception as e:
-            logger.error(f"❌ Lỗi intelligent proxy checkout: {e}")
+            logger.error(f"[ERROR] Error intelligent proxy checkout: {e}")
             return None
     
     def _select_best_proxy(self, available_proxies: List[ManagedResource]) -> ManagedResource:
@@ -481,28 +667,36 @@ class ProxyManager:
         """
         proxy_id = proxy_config.get("proxy_id")
         if not proxy_id:
-            logger.warning("⚠️ Proxy config thiếu proxy_id, không thể checkin")
+            logger.warning("[WARN] Proxy config missing proxy_id, cannot checkin")
             return
         
         with self.locks():
             self._intelligent_checkin(proxy_id, status)
-            self._sync_resources_to_file()
+            self._sync_resources_to_db()
     
     def _intelligent_checkin(self, proxy_id: str, status: str):
-        """Intelligent checkin với performance tracking."""
+        """
+        Intelligent checkin với performance tracking.
+        
+        [OK] FIX CRITICAL: Reload file first to prevent overwriting changes from other workers!
+        """
         try:
+            # [OK] FIX: Reload from file to get latest state from other workers
+            # CRITICAL for multi-process (Celery workers) to prevent lost updates
+            self._load_proxies_from_db()
+            
             if proxy_id not in self.resource_pool:
-                logger.warning(f"⚠️ Proxy không tồn tại: {proxy_id}")
+                logger.warning(f"[WARN] Proxy không exists: {proxy_id}")
                 return
             
             resource = self.resource_pool[proxy_id]
             old_status = resource.status
             resource.status = status
             
-            logger.info(f"🔓 Checked in proxy: {proxy_id} ({old_status} → {status})")
+            logger.info(f"[UNLOCK] Checked in proxy: {proxy_id} ({old_status} → {status})")
             
         except Exception as e:
-            logger.error(f"❌ Lỗi intelligent checkin proxy {proxy_id}: {e}")
+            logger.error(f"[ERROR] Error intelligent checkin proxy {proxy_id}: {e}")
     
     def _validate_proxy_config(self, config: Dict[str, Any]) -> bool:
         """Enhanced proxy configuration validation."""
@@ -548,7 +742,7 @@ class ProxyManager:
             # Validate proxy connectivity trước khi convert
             if not self.health_check_proxy(proxy_config):
                 proxy_id = proxy_config.get('proxy_id', 'unknown')
-                logger.warning(f"⚠️ Proxy {proxy_id} failed connectivity test, skipping")
+                logger.warning(f"[WARN] Proxy {proxy_id} failed connectivity test, skipping")
                 return None
 
             playwright_proxy = {
@@ -565,30 +759,137 @@ class ProxyManager:
                 playwright_proxy["server"] = f"socks5://{proxy_config['host']}:{proxy_config['port']}"
 
             proxy_id = proxy_config.get('proxy_id', 'unknown')
-            logger.info(f"✅ Validated and converted proxy for Playwright: {proxy_id}")
+            logger.info(f"[OK] Validated and converted proxy for Playwright: {proxy_id}")
             return playwright_proxy
 
         except Exception as e:
-            logger.error(f"❌ Lỗi convert proxy cho Playwright: {e}")
+            logger.error(f"[ERROR] Error convert proxy cho Playwright: {e}")
             return None
     
-    def health_check_proxy(self, proxy_config: Dict[str, Any]) -> bool:
+    def detect_proxy_geolocation(self, proxy_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Enhanced health check với response time tracking (synchronous version)
+        [GEO] PHASE 3: Detect proxy geolocation via IP API (for timezone/location spoofing)
         
-        ⚠️ WARNING: This is a BLOCKING sync operation using requests.Session().get()
-        
-        DO NOT call this from async context (will block event loop)!
-        For async operations, use health_check_proxy_async() instead.
+        Uses free IP geolocation APIs to detect proxy location.
+        Falls back to multiple APIs if one fails (rate limiting).
         
         Args:
             proxy_config: Config dict của proxy
             
         Returns:
+            Dict with timezone, latitude, longitude, country, city or None if failed
+        """
+        try:
+            # Build proxy URL for requests
+            if proxy_config.get("type") == "socks5":
+                proxy_url = f"socks5://{proxy_config['host']}:{proxy_config['port']}"
+            else:
+                proxy_url = f"http://{proxy_config['host']}:{proxy_config['port']}"
+            
+            if proxy_config.get("username") and proxy_config.get("password"):
+                if proxy_config.get("type") == "socks5":
+                    proxy_url = f"socks5://{proxy_config['username']}:{proxy_config['password']}@{proxy_config['host']}:{proxy_config['port']}"
+                else:
+                    proxy_url = f"http://{proxy_config['username']}:{proxy_config['password']}@{proxy_config['host']}:{proxy_config['port']}"
+            
+            proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+            
+            # Try multiple free geolocation APIs (with fallback)
+            apis = [
+                ('https://ipapi.co/json/', lambda r: {
+                    'timezone': r.get('timezone', 'UTC'),
+                    'latitude': r.get('latitude', 0),
+                    'longitude': r.get('longitude', 0),
+                    'country': r.get('country_name', 'Unknown'),
+                    'city': r.get('city', 'Unknown')
+                }),
+                ('http://ip-api.com/json/', lambda r: {
+                    'timezone': r.get('timezone', 'UTC'),
+                    'latitude': r.get('lat', 0),
+                    'longitude': r.get('lon', 0),
+                    'country': r.get('country', 'Unknown'),
+                    'city': r.get('city', 'Unknown')
+                }),
+            ]
+            
+            for api_url, parser in apis:
+                try:
+                    response = requests.get(
+                        api_url,
+                        proxies=proxies,
+                        timeout=10,
+                        verify=False  # Some proxies have SSL issues
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        geo_data = parser(data)
+                        
+                        # [OK] FIX ISSUE #3: Validate geolocation data
+                        lat = geo_data.get('latitude')
+                        lon = geo_data.get('longitude')
+                        
+                        # Reject invalid coordinates (0,0 or None)
+                        if lat and lon and (abs(lat) > 0.01 or abs(lon) > 0.01):
+                            logger.info(f"[GEO] Proxy {proxy_config.get('proxy_id')}: {geo_data['city']}, {geo_data['country']} (TZ: {geo_data['timezone']})")
+                            return geo_data
+                        else:
+                            logger.warning(f"[WARN] Invalid coordinates from {api_url}: ({lat}, {lon}), trying next API...")
+                            continue
+                        
+                except Exception as e:
+                    logger.debug(f"Geolocation API {api_url} failed: {e}, trying next...")
+                    continue
+            
+            logger.warning(f"[WARN] All geolocation APIs failed for proxy {proxy_config.get('proxy_id')}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Error detecting proxy geolocation: {e}")
+            return None
+
+    def health_check_proxy(self, proxy_config: Dict[str, Any], use_cache: bool = True) -> bool:
+        """
+        Enhanced health check với response time tracking (synchronous version)
+
+        [WARN] WARNING: This is a BLOCKING sync operation using requests.Session().get()
+
+        DO NOT call this from async context (will block event loop)!
+        For async operations, use health_check_proxy_async() instead.
+
+        Args:
+            proxy_config: Config dict của proxy
+            use_cache: If True, return cached result if recently verified (within 5 min)
+
+        Returns:
             True nếu proxy hoạt động tốt, False nếu có vấn đề
         """
         proxy_id = proxy_config.get("proxy_id")
-        
+
+        # FIX C1: Early cache check to avoid blocking health checks
+        if use_cache and proxy_id and proxy_id in self.resource_pool:
+            resource = self.resource_pool[proxy_id]
+            last_checked = resource.metadata.get("last_checked")
+            if last_checked:
+                try:
+                    last_check_time = datetime.fromisoformat(last_checked)
+                    cache_age = (datetime.now() - last_check_time).total_seconds()
+
+                    # Return cached result if verified within last 5 minutes
+                    if cache_age < 300:  # 5 minutes
+                        # Assume healthy if status is READY/IN_USE and no recent failures
+                        if resource.status in ["READY", "IN_USE"] and resource.consecutive_failures == 0:
+                            logger.debug(f"[CACHE] Proxy {proxy_id} recently verified ({cache_age:.0f}s ago)")
+                            return True
+                        elif resource.consecutive_failures >= 2:
+                            logger.debug(f"[CACHE] Proxy {proxy_id} recently failed ({cache_age:.0f}s ago)")
+                            return False
+                except Exception as e:
+                    logger.debug(f"Cache parse error for {proxy_id}: {e}")
+
         try:
             # Create requests session with proxy
             session = requests.Session()
@@ -629,28 +930,36 @@ class ProxyManager:
                     
                     # Accept 200, 301, 302 as success
                     if response.status_code in [200, 301, 302]:
-                        logger.debug(f"✅ Proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
-                        # 🔥 FIX #3: Reset consecutive failures on success
+                        logger.debug(f"[OK] Proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
+                        # [HOT] FIX #3: Reset consecutive failures on success
                         if proxy_id and proxy_id in self.resource_pool:
-                            self.resource_pool[proxy_id].consecutive_failures = 0
-                            # 🔥 CRITICAL FIX: Persist success immediately
-                            self._sync_resources_to_file()
+                            resource = self.resource_pool[proxy_id]
+                            resource.consecutive_failures = 0
+                            
+                            # [GEO] PHASE 3: Detect geolocation if not already cached (once per proxy)
+                            if "geolocation" not in resource.metadata or not resource.metadata.get("geolocation"):
+                                logger.info(f"[GEO] Detecting geolocation for proxy {proxy_id}...")
+                                geo_data = self.detect_proxy_geolocation(proxy_config)
+                                if geo_data:
+                                    resource.metadata["geolocation"] = geo_data
+                                    logger.info(f"[OK] Cached geolocation: {geo_data['city']}, {geo_data['country']}")
+                            
+                            # ✅ FIX RACE: Removed _sync_resources_to_db() - caller must handle sync
                         return True
                 except Exception as e:
                     logger.debug(f"Endpoint {endpoint} failed for {proxy_id}: {str(e)[:50]}")
                     continue
             
-            # 🔥 FIX #3: AGGRESSIVE QUARANTINE - All endpoints failed
-            logger.warning(f"⚠️ Proxy health check failed: {proxy_id} - All test endpoints failed")
+            # [HOT] FIX #3: AGGRESSIVE QUARANTINE - All endpoints failed
+            logger.warning(f"[WARN] Proxy health check failed: {proxy_id} - All test endpoints failed")
             
             # Increment consecutive failures and quarantine if threshold reached
             if proxy_id and proxy_id in self.resource_pool:
                 resource = self.resource_pool[proxy_id]
                 resource.consecutive_failures += 1
-                logger.warning(f"🚨 Proxy {proxy_id} consecutive failures: {resource.consecutive_failures}")
+                logger.warning(f"[ALERT] Proxy {proxy_id} consecutive failures: {resource.consecutive_failures}")
                 
-                # 🔥 CRITICAL FIX: Persist failure count immediately
-                self._sync_resources_to_file()
+                # ✅ FIX RACE: Removed _sync_resources_to_db() - caller must handle sync
                 
                 # Quarantine immediately after 2 consecutive health check failures
                 if resource.consecutive_failures >= 2:
@@ -658,12 +967,12 @@ class ProxyManager:
                         proxy_id, 
                         f"Health check failed {resource.consecutive_failures} times consecutively"
                     )
-                    logger.critical(f"⛔ Proxy {proxy_id} QUARANTINED after repeated health check failures")
+                    logger.critical(f"[STOP] Proxy {proxy_id} QUARANTINED after repeated health check failures")
             
             return False
                 
         except Exception as e:
-            logger.warning(f"⚠️ Proxy health check error: {proxy_id} - {e}")
+            logger.warning(f"[WARN] Proxy health check error: {proxy_id} - {e}")
             # Also count as failure
             if proxy_id and proxy_id in self.resource_pool:
                 self.resource_pool[proxy_id].consecutive_failures += 1
@@ -723,22 +1032,26 @@ class ProxyManager:
                             
                             # Accept 200, 301, 302 as success
                             if response.status in [200, 301, 302]:
-                                logger.debug(f"✅ Async proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
+                                logger.debug(f"[OK] Async proxy health check OK: {proxy_id} ({response_time:.2f}s via {endpoint})")
                                 return True
                     except Exception as e:
                         logger.debug(f"Endpoint {endpoint} failed for {proxy_id}: {str(e)[:50]}")
                         continue
                 
                 # All endpoints failed
-                logger.warning(f"⚠️ Async proxy health check failed: {proxy_id} - All test endpoints failed")
+                logger.warning(f"[WARN] Async proxy health check failed: {proxy_id} - All test endpoints failed")
                 return False
                         
         except Exception as e:
-            logger.warning(f"⚠️ Async proxy health check error: {proxy_id} - {e}")
+            logger.warning(f"[WARN] Async proxy health check error: {proxy_id} - {e}")
             return False
     
     def get_stats(self) -> Dict[str, Any]:
-        """Lấy thống kê chi tiết về proxies và performance."""
+        """
+        Lấy thống kê chi tiết về proxies và performance.
+        
+        Uses thread-only lock for performance (acceptable stale data for stats).
+        """
         with self.lock:
             stats = {
                 'total': len(self.resource_pool),
@@ -807,10 +1120,10 @@ class ProxyManager:
         return stats
     
     def mark_proxy_failed(self, proxy_config: Dict[str, Any], reason: str = ""):
-        """Đánh dấu proxy bị lỗi và update performance metrics."""
+        """Đánh dấu proxy bị error và update performance metrics."""
         proxy_id = proxy_config.get("proxy_id")
         if proxy_id:
-            logger.warning(f"❌ Marking proxy failed: {proxy_id} - {reason}")
+            logger.warning(f"[ERROR] Marking proxy failed: {proxy_id} - {reason}")
             # Report failure for performance tracking
             self.report_outcome(proxy_id, 'failure', {'reason': reason})
             # Check in with FAILED status if not quarantined
@@ -826,12 +1139,14 @@ class ProxyManager:
                 resource.quarantine_until_timestamp = None
                 resource.quarantine_reason = None
             
-            self._sync_resources_to_file()
-            logger.info("🔄 Reset tất cả proxies về READY")
+            self._sync_resources_to_db()
+            logger.info("[RELOAD] Reset tất cả proxies về READY")
     
     def report_outcome(self, proxy_id: str, outcome: str, details: Optional[Dict[str, Any]] = None) -> None:
         """
         Báo cáo kết quả task để cập nhật performance metrics cho proxy
+        
+        [OK] FIX CRITICAL: Reload file first to prevent overwriting changes from other workers!
         
         Args:
             proxy_id: ID của proxy
@@ -842,8 +1157,11 @@ class ProxyManager:
             None
         """
         with self.locks():
+            # [OK] FIX: Reload from file to get latest state from other workers
+            self._load_proxies_from_db()
+            
             if proxy_id not in self.resource_pool:
-                logger.warning(f"⚠️ Proxy không tồn tại để report outcome: {proxy_id}")
+                logger.warning(f"[WARN] Proxy không exists để report outcome: {proxy_id}")
                 return
             
             resource = self.resource_pool[proxy_id]
@@ -857,10 +1175,10 @@ class ProxyManager:
                 if details and 'response_time' in details:
                     resource.metadata["response_time"] = details['response_time']
                 
-                logger.debug(f"✅ Success reported for proxy {proxy_id}")
+                logger.debug(f"[OK] Success reported for proxy {proxy_id}")
             elif outcome == 'failure':
                 resource.consecutive_failures += 1
-                logger.debug(f"❌ Failure reported for proxy {proxy_id} (consecutive: {resource.consecutive_failures})")
+                logger.debug(f"[ERROR] Failure reported for proxy {proxy_id} (consecutive: {resource.consecutive_failures})")
             
             # Recalculate success rate
             resource.calculate_success_rate()
@@ -874,7 +1192,7 @@ class ProxyManager:
                 self.quarantine_resource(proxy_id, f"Performance threshold exceeded: {resource.consecutive_failures} consecutive failures, {resource.success_rate:.2f} success rate")
             
             # Sync to file
-            self._sync_resources_to_file()
+            self._sync_resources_to_db()
     
     def quarantine_resource(self, proxy_id: str, reason: str = "Performance issues"):
         """
@@ -886,7 +1204,7 @@ class ProxyManager:
         """
         with self.locks():
             if proxy_id not in self.resource_pool:
-                logger.warning(f"⚠️ Proxy không tồn tại để quarantine: {proxy_id}")
+                logger.warning(f"[WARN] Proxy không exists để quarantine: {proxy_id}")
                 return
             
             resource = self.resource_pool[proxy_id]
@@ -895,14 +1213,16 @@ class ProxyManager:
             resource.quarantine_count += 1
             resource.quarantine_until_timestamp = datetime.now() + timedelta(minutes=self.quarantine_duration_minutes)
             
-            logger.warning(f"🚨 Proxy {proxy_id} quarantined until {resource.quarantine_until_timestamp.strftime('%H:%M:%S')} - {reason}")
+            logger.warning(f"[ALERT] Proxy {proxy_id} quarantined until {resource.quarantine_until_timestamp.strftime('%H:%M:%S')} - {reason}")
             
             # Sync to file
-            self._sync_resources_to_file()
+            self._sync_resources_to_db()
     
     def get_proxy_performance(self, proxy_id: str) -> Optional[Dict[str, Any]]:
         """
         Lấy performance metrics của một proxy cụ thể
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Args:
             proxy_id: ID của proxy
@@ -931,6 +1251,8 @@ class ProxyManager:
     def get_best_performers(self, limit: int = 5) -> List[Dict[str, Any]]:
         """
         Lấy danh sách proxies với performance tốt nhất
+        
+        Uses thread-only lock for performance (read-only operation).
         
         Args:
             limit: Số lượng proxies trả về
@@ -973,16 +1295,18 @@ class ProxyManager:
         """
         with self.locks():
             released_count = self._process_cooldowns()
-            self._sync_resources_to_file()
+            self._sync_resources_to_db()
             return released_count
 
 
     def get_healthy_proxy_ids(self, force_check: bool = False) -> List[str]:
         """
-        ✅ FIX #3: Get list of healthy proxy IDs with optional health check
+        [OK] FIX #3: Get list of healthy proxy IDs with optional health check
         
         This method pre-validates proxies before checkout to avoid wasting resources
         on failed proxies.
+        
+        Uses thread-only lock initially, then cross-process lock for metadata updates.
         
         Args:
             force_check: If True, run health check even if recently verified
@@ -992,17 +1316,17 @@ class ProxyManager:
         """
         healthy_proxy_ids = []
         
-        with self.lock:
+        with self.lock:  # Thread-only lock for reading
             for proxy_id, proxy_resource in self.resource_pool.items():
                 # Skip quarantined or disabled
                 if proxy_resource.is_quarantined() or proxy_resource.status in ["DISABLED", "TESTING"]:
-                    logger.debug(f"⚠️ Proxy {proxy_id} skipped - quarantined or disabled")
+                    logger.debug(f"[WARN] Proxy {proxy_id} skipped - quarantined or disabled")
                     continue
                 
                 # Validate config exists
                 proxy_config = proxy_resource.metadata.get("config")
                 if not proxy_config or not self._validate_proxy_config(proxy_config):
-                    logger.debug(f"⚠️ Proxy {proxy_id} skipped - invalid config")
+                    logger.debug(f"[WARN] Proxy {proxy_id} skipped - invalid config")
                     continue
                 
                 # Check if recently verified (within 5 minutes) unless force_check
@@ -1013,7 +1337,7 @@ class ProxyManager:
                             last_check_time = datetime.fromisoformat(last_checked)
                             if datetime.now() - last_check_time < timedelta(minutes=5):
                                 healthy_proxy_ids.append(proxy_id)
-                                logger.debug(f"✅ Proxy {proxy_id} recently verified (cached)")
+                                logger.debug(f"[OK] Proxy {proxy_id} recently verified (cached)")
                                 continue
                         except Exception as e:
                             logger.debug(f"Failed to parse last_checked for {proxy_id}: {e}")
@@ -1026,27 +1350,35 @@ class ProxyManager:
                     # Update last_checked timestamp to cache result
                     proxy_resource.metadata["last_checked"] = datetime.now().isoformat()
                     healthy_proxy_ids.append(proxy_id)
-                    logger.debug(f"✅ Proxy {proxy_id} verified healthy")
+                    logger.debug(f"[OK] Proxy {proxy_id} verified healthy")
                 else:
-                    logger.warning(f"⚠️ Proxy {proxy_id} failed health check")
+                    logger.warning(f"[WARN] Proxy {proxy_id} failed health check")
         
-        logger.info(f"📊 Found {len(healthy_proxy_ids)} healthy proxies out of {len(self.resource_pool)} total")
+        # ✅ FIX RACE: Sync metadata updates (last_checked timestamps)
+        if any(self.resource_pool[pid].metadata.get("last_checked") for pid in healthy_proxy_ids if pid in self.resource_pool):
+            with self.locks():
+                self._sync_resources_to_db()
+        
+        logger.info(f"[STATS] Found {len(healthy_proxy_ids)} healthy proxies out of {len(self.resource_pool)} total")
         return healthy_proxy_ids
     
     def reload_proxies_from_file(self):
         """
-        🔄 Reload proxies from file và update resource pool
+        ⚠️ DEPRECATED - DATABASE-FIRST APPROACH
         
-        Useful khi user cập nhật proxies.txt
+        [RELOAD] Reload proxies from file và update resource pool (LEGACY)
+        
+        This method is DEPRECATED. Use Admin Panel UI to add/remove proxies instead.
+        ProxyManager now loads from DATABASE via _load_proxies_from_db().
         """
-        logger.info("🔄 Reloading proxies from file...")
+        logger.info("[RELOAD] Reloading proxies from file...")
         
         with self.locks():
             # Load proxies from file
             new_proxies = self._load_proxies_from_file()
             
             if not new_proxies:
-                logger.warning("⚠️ No proxies found in file")
+                logger.warning("[WARN] No proxies found in file")
                 return {'added': 0, 'removed': 0, 'total': len(self.resource_pool)}
             
             # Track changes
@@ -1099,9 +1431,9 @@ class ProxyManager:
                     logger.info(f"➕ Added new proxy: {proxy_id} ({config_id})")
             
             # Sync to file
-            self._sync_resources_to_file()
+            self._sync_resources_to_db()
             
-            logger.info(f"✅ Proxy reload completed: +{added_count} -{removed_count} = {len(self.resource_pool)} total")
+            logger.info(f"[OK] Proxy reload completed: +{added_count} -{removed_count} = {len(self.resource_pool)} total")
             
             return {
                 'added': added_count,
@@ -1113,13 +1445,13 @@ class ProxyManager:
         """
         Chạy health check toàn diện cho tất cả proxies (sử dụng cho maintenance)
         
-        ENHANCED: Reload proxies từ file trước khi check
+        DATABASE-FIRST: Reload proxies từ DATABASE (không dùng file nữa)
         """
         logger.info("🛠️ Bắt đầu comprehensive health check cho tất cả proxies")
         
-        # Reload proxies from file first
-        reload_result = self.reload_proxies_from_file()
-        logger.info(f"📥 Reloaded proxies: {reload_result}")
+        # Reload proxies from DATABASE (not file)
+        self._load_proxies_from_db()
+        logger.info(f"📥 Reloaded {len(self.resource_pool)} proxies from database")
         
         with self.locks():
             checked_count = 0
@@ -1145,15 +1477,15 @@ class ProxyManager:
                         checked_count += 1
             
             # Sync results to file
-            self._sync_resources_to_file()
+            self._sync_resources_to_db()
             
-            logger.info(f"✅ Comprehensive health check hoàn thành: {healthy_count}/{checked_count} proxies healthy")
+            logger.info(f"[OK] Comprehensive health check completed: {healthy_count}/{checked_count} proxies healthy")
             
             return {
                 "checked_count": checked_count,
                 "healthy_count": healthy_count,
                 "unhealthy_count": checked_count - healthy_count,
-                "reload_stats": reload_result
+                "total_proxies": len(self.resource_pool)
             }
 
 
@@ -1178,18 +1510,18 @@ def test_proxy_manager():
         
         # Test checkout
         proxy = manager.checkout_proxy(timeout=5)
-        print(f"✅ Checkout proxy: {proxy}")
+        print(f"[OK] Checkout proxy: {proxy}")
         
         # Test stats
         stats = manager.get_stats()
-        print(f"✅ Stats: {stats}")
+        print(f"[OK] Stats: {stats}")
         
         # Test checkin
         if proxy:
             manager.checkin_proxy(proxy)
-            print(f"✅ Checkin proxy: {proxy.get('proxy_id')}")
+            print(f"[OK] Checkin proxy: {proxy.get('proxy_id')}")
         
-        print("✅ ProxyManager test completed!")
+        print("[OK] ProxyManager test completed!")
         
     finally:
         # Cleanup
