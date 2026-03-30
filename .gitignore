@@ -4,8 +4,14 @@ venv/
 .env
 .vscode/
 .idea/
+.cursor/
+.serena/
+.ngrok_token
 sessions/
 screenshots/
 logs/
+CODEBASE_ANALYSIS_REPORT.md
+CODEBASE_REVIEW_REPORT.md
+DEPLOY_TO_VPS.md
 nul
 **/nul
