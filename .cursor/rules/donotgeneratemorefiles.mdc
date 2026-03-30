@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+đừng có suốt ngày chăm chăm vào việc tạo ra file mới, báo cáo mới. chỉ sửa các file sẵn tại codebase và khi cần phải tạo ra file mới ví dụ như những file để test các thứ thì chỉ tập trung sửa trong file đấy thôi, đừng có tạo ra một file khác khi file đó không hoạt động. nói chung là càng ít file càng tốt

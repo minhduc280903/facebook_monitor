@@ -1,39 +1,11 @@
-# Python
-__pycache__/
+﻿__pycache__/
 *.pyc
 venv/
-.pytest_cache/
-
-# Environment & Secrets
 .env
-.ngrok_token
-proxies.txt
-
-# Editor/IDE
 .vscode/
 .idea/
-.cursor/
-.claude/
-.serena/
-.cursorignore
-
-# Runtime Data
 sessions/
 screenshots/
 logs/
-
-# Reports & Docs (Excluded)
-CODEBASE_ANALYSIS_REPORT.md
-CODEBASE_REVIEW_REPORT.md
-DEPLOY_TO_VPS.md
-
-# VPS/Deployment Scripts
-setup_proxies_vps.py
-setup_ubuntu.sh
-sync_to_vps.ps1
-delete_checkpointed_sessions.py
-reset_sessions.py
-
-# System
-.DS_Store
-Thumbs.db
+nul
+**/nul
